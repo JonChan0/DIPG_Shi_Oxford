@@ -1,0 +1,1865 @@
+---
+title: "Downstream_MAGeCK_Analysis"
+author: "Jonathan Chan"
+date: '`r format(Sys.Date())`'
+output: 
+  html_document:
+    code_folding: hide
+bibliography:
+  - Bibliography.bib
+---
+#! indicates that you need to modify this code in order to tailor to other analyses.
+
+```{r setup, include=FALSE}
+#Loading packages
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+library(tidyverse)
+library(MAGeCKFlute)
+library(clusterProfiler)
+library(reshape2)
+library(viridis)
+library(ggrepel)
+library(ggsignif)
+#library(showtext)
+library(scales)
+
+working_directory <- getwd()
+working_directory <- paste(working_directory,'dipg_screen_data', sep='/') #! Need to define your working directory folder here
+
+#Importing Futura BKBT Font
+#font_add(family = "futura_bkt", regular = "./Futura-Bk-BT-Book_18979.ttf")
+# turn on shoCONext
+#showtext_auto()
+
+#Setting theme for ggplot to classic - You can change your plot text font and size here
+theme_set(
+  theme_classic()
+  + theme(text = element_text(family = 'sans', size=14))
+  ) 
+
+#This function is for the generation of plots to export several ggplot objects into single pdf
+multiple_plot_exporter <- function(input_plot_list, pdf_name){
+  
+  pdf(paste(pdf_name,'.pdf', sep=''), onefile=TRUE)
+  for (i in seq_along(input_plot_list)){
+    print(input_plot_list[[i]])
+  }
+  dev.off()
+}
+#This function is for the import of MAGeCK derived gene_summary.txt files
+gene_summary_importer <- function(filename, working_directory){
+  gene_summary <- as_tibble(read_delim(paste(working_directory,filename, sep='/')))
+  
+  return(gene_summary)
+}
+
+#This imports the list of common essential genes from DepMap's Feb22 release
+common_essentials <- read_csv(paste(working_directory,'library_data/CRISPR_common_essentials_depmap_feb22.csv',sep='/')) %>%
+  mutate(gene = str_extract(gene,'[^ (]*'))
+
+#This imports the list of coding tumour suppressor genes from TSGene Database (6-05-2022 Version)
+tsgenes <- read_csv(paste(working_directory,'library_data/TSGene_coding_tsg.csv', sep='/')) %>%
+  rename(gene = `Gene Name`)
+
+
+
+```
+
+# Downstream Analysis of MAGeCK-MLE via MAGeCK-FLUTE Pipeline
+
+This notebook outlines QC at the sequencing; read; sample; gene-level as per guidelines from @Li2015 as well as functional analysis via the MAGeCK-Flute R package from @Wang2019.
+
+Below code imports the count data.
+```{r import_counts}
+
+count_summary <- as_tibble(read_delim(paste(working_directory,"count1b.countsummary.txt",sep='/'))) %>%
+  #Appends a CellLine column to distinguish between two cell lines. 
+  mutate(CellLine = case_when(str_detect(Label,'CON')~'K27M', 
+                              str_detect(Label, 'KO')~'K27M-KO', 
+                              str_detect(Label, 'Plasmid')~'Plasmid')) %>% 
+  #!Converts CellLine column into a factor (i.e an ordered list) 
+  mutate(CellLine = factor(CellLine, levels=c('Plasmid','K27M','K27M-KO'))) %>%
+  #Appends a Replicate column to indicate which sample is from either replicate 1 or replicate 2
+  mutate(Replicate = case_when(str_detect(Label,'r1|Plasmid')~'1', str_detect(Label, 'r2')~'2')) %>%
+  #Converts the Label column in count_summary.txt into a factor (i.e ordered list)
+  mutate(Label = factor(Label, levels=c('Plasmid','CON_r1_d0','CON_r1_d11','CON_r1_d21','CON_r2_d0','CON_r2_d11','CON_r2_d21','KO_r1_d0','KO_r1_d11','KO_r1_d21','KO_r2_d0','KO_r2_d11','KO_r2_d21'), ordered=TRUE))
+
+#! This imports the raw count files from MAGeCK
+raw_counts <- read_delim(paste(working_directory, 'count1b.count.txt', sep='/'))
+norm_counts <- read_delim(paste(working_directory, 'count1b.count_normalized.txt',sep='/'))
+
+#! This defines the samplenames for all your samples i.e the labelsfrom count_summary.txt, as well as for each replicate.
+samplenames <- c('Plasmid','CON_r1_d0','CON_r2_d0','CON_r1_d11','CON_r2_d11','CON_r1_d21','CON_r2_d21','KO_r1_d0','KO_r2_d0','KO_r1_d11','KO_r2_d11','KO_r1_d21','KO_r2_d21')
+rep1_samples <- c(#'Plasmid',
+                  'CON_r1_d0','CON_r1_d11','CON_r1_d21','KO_r1_d0','KO_r1_d11','KO_r1_d21')
+rep2_samples <- c(#'Plasmid',
+                  'CON_r2_d0','CON_r2_d11','CON_r2_d21','KO_r2_d0','KO_r2_d11','KO_r2_d21')
+```
+## Quality Control: Read Level
+
+This uses the output of mageck count to assess numerous QC measures at the read level:
+
+- Total number of sequencing reads
+- Total number of mapped reads to gRNA library
+  - Expected to be >300 x number of gRNAs
+- % of total reads mapped
+  - Expected to be > 65%
+- Number of sgRNAs with zero read count
+  - Low number in the plasmid library or early time points
+  - Expected at most 1% of total sgRNAs
+- Gini index of read count distribution (a measure of unevenness of distribution between samples)
+  - Expected at most 0.1 for plasmid library & early time points; 0.2 for negative selection samples
+- Distribution of the reads over the different gRNAs
+  - Expected to have an even distribution across the different gRNAs across all samples
+
+
+It also uses a threshold derived from the distribution plot of normalised read counts to remove outliers.
+This has been chosen as 3000 from observation.
+  
+```{r read QC-mapping}
+mapping_ratio_QC <- function(input_counts, plasmid){
+  
+  if (plasmid == FALSE){
+    input_counts <- filter(input_counts,Label != 'Plasmid')
+  }
+  
+  mapped_reads <- ggplot(input_counts)+
+  geom_col(aes(x=Label, y=Mapped, fill=CellLine, alpha='Mapped Reads'))+
+  geom_col(aes(x=Label, y=Reads, fill=CellLine, alpha='Total Reads'))+
+  scale_fill_brewer(type='qual',palette='Set2')+
+  scale_alpha_manual(values=c(1,0.5))+
+  geom_hline(aes(yintercept=input_counts$TotalsgRNAs[[1]] * 300,linetype='300x Coverage Threshold'),col='red',)+
+  scale_linetype_manual(values = c('dashed'))+
+  geom_text(aes(x=Label, y=Mapped, label=format(round(Percentage, digits=1), nsmall = 1) ),size = 3.5, vjust = -0.5)+
+  labs(x='Timepoint', y='Number of Reads')+ 
+       # title=str_wrap('Mapping QC indicates good quality of raw reads with mapping ratio > 65% and majority of samples with >300x read coverage', width=55),
+       #  #subtitle='Numbers indicate % of mapped reads and R indicates replicate number',
+       # caption=substitute(paste('Threshold as per (Li ',italic('et al,'), ' 2015)')))+
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=60, vjust = +0.5),
+        axis.title.x=element_text(vjust = -0.15))+
+  scale_x_discrete(labels = c(#'Plasmid',
+                              'Day 0 (R1)','Day 11 (R1)','Day 21 (R1)',
+                              'Day 0 (R2)','Day 11 (R2)','Day 21 (R2)',
+                              'Day 0 (R1)','Day 11 (R1)','Day 21 (R1)',
+                              'Day 0 (R2)','Day 11 (R2)','Day 21 (R2)'))
+
+return(mapped_reads)
+}
+  
+dipg_mapping_QC <- mapping_ratio_QC(count_summary, plasmid=FALSE)
+print(dipg_mapping_QC)
+```
+
+```{r read QC - zerocounts}
+
+zerocount_QC <- function(input_counts, plasmid){
+  
+    if (plasmid == FALSE){
+    input_counts <- filter(input_counts,Label != 'Plasmid')
+  }
+  
+  zerocounts <- ggplot(input_counts, aes(x=Label, y=Zerocounts))+
+    geom_col(aes(fill=CellLine))+
+    scale_fill_brewer(type='qual',palette='Set2')+
+    labs(x='Timepoint', y='Number of gRNAs with zero mapped reads')+
+       # title=str_wrap('Low number of sgRNAs with zero reads supports good quality of raw reads', width = 55),
+       # caption=substitute(paste('Threshold as per (Li ',italic('et al,'), ' 2015)')))+
+    geom_hline(aes(yintercept=input_counts$TotalsgRNAs[[1]] * 0.01,linetype='1% of Total gRNAs Threshold'),col='red')+
+    scale_linetype_manual("Title", values = 2)+
+    theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=60, vjust=+0.5),
+        axis.title.x=element_text(vjust = -0.15))+
+  scale_x_discrete(labels = c(#'Plasmid',
+                              'Day 0 (R1)','Day 11 (R1)','Day 21 (R1)',
+                              'Day 0 (R2)','Day 11 (R2)','Day 21 (R2)',
+                              'Day 0 (R1)','Day 11 (R1)','Day 21 (R1)',
+                              'Day 0 (R2)','Day 11 (R2)','Day 21 (R2)'))
+  
+  return(zerocounts)
+  
+}
+
+dipg_zerocount <- zerocount_QC(count_summary, plasmid=FALSE)
+print(dipg_zerocount)
+
+```
+
+```{r read QC - Gini}
+
+giniindex_QC <- function(input_counts, plasmid){
+    if (plasmid == FALSE){
+    input_counts <- filter(input_counts,Label != 'Plasmid')
+  }
+  
+  gini_index <-ggplot(input_counts, aes(x=Label, y=GiniIndex))+
+    geom_col(aes(fill=CellLine))+
+    scale_fill_brewer(type='qual',palette='Set2')+
+    labs(x='Timepoint', y='Gini Index')+ 
+       # title=str_wrap('Low Gini Index indicates even distribution of raw reads across samples and supports good quality of reads', width = 55),
+       # caption=substitute(paste('Threshold as per (Li ',italic('et al,'), ' 2015)')))+
+    geom_hline(aes(yintercept=0.1,linetype='Threshold for Baseline Samples'),col='red')+
+    geom_hline(aes(yintercept=0.2,linetype='Threshold for Endpoint Samples'),col='black')+
+    scale_linetype_manual(name = "Threshold", values = c(2, 2), 
+                          guide = guide_legend(override.aes = list(color = c('red','black'))))+
+    scale_colour_manual(values=c('red','black'))+ 
+    theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=60, vjust = +0.5),
+        axis.title.x=element_text(vjust = -0.15))+
+  scale_x_discrete(labels = c(#'Plasmid',
+                              'Day 0 (R1)','Day 11 (R1)','Day 21 (R1)',
+                              'Day 0 (R2)','Day 11 (R2)','Day 21 (R2)',
+                              'Day 0 (R1)','Day 11 (R1)','Day 21 (R1)',
+                              'Day 0 (R2)','Day 11 (R2)','Day 21 (R2)'))
+  
+  return(gini_index)
+}
+
+dipg_giniindex <- giniindex_QC(count_summary, plasmid=FALSE)
+print(dipg_giniindex)
+```
+
+```{r read_distribution}
+
+read_distribution_plotter <- function(input_counts, samples_to_include,title='', nt_controls = FALSE){
+  
+  if (nt_controls == TRUE){
+    input_counts <- filter(input_counts, is.na(Gene))
+  }
+  
+  melted_counts <- input_counts %>%
+    select(sgRNA,Gene,samples_to_include) %>%
+    reshape2::melt() %>%
+    rename(sample = variable, count = value) %>%
+    mutate(CellLine = case_when(str_detect(sample,'CON')~'K27M',
+                                str_detect(sample,'KO')~'K27M-KO',
+                                str_detect(sample,'Plasmid')~'Plasmid')) %>%
+    mutate(Timepoint = case_when(str_detect(sample,'(d0)|(Plasmid)')~'0',
+                                 str_detect(sample,'d11')~'11',
+                                 str_detect(sample,'d21')~'21',
+                                 ))
+  
+  read_distribution <- ggplot(melted_counts) +
+    geom_density(aes(x=count, col=CellLine, linetype=Timepoint)) +
+    scale_colour_brewer(name='Cell Line',type='qual',palette='Set2')+
+    scale_linetype_manual(name= 'Timepoint (Day)',labels=c('0','11','21'), values = c('solid','longdash','dotted'))+
+    labs(x='Read Count', y='Density', 
+       title=str_wrap(title, width=65))
+  
+  return(read_distribution)
+}
+
+# dipg_read_distribution_rep1 <- read_distribution_plotter(raw_counts,rep1_samples,'Distribution of raw read counts for replicate 1 samples')
+# dipg_read_distribution_rep2 <- read_distribution_plotter(raw_counts,rep2_samples,'Distribution of raw read counts for replicate 2 samples')
+# print(dipg_read_distribution_rep1)
+# print(dipg_read_distribution_rep2)
+# 
+# dipg_nt_control_read_distribution_rep1 <- read_distribution_plotter(raw_counts,rep1_samples, 'Distribution of raw read counts of non-targeting gRNAs for replicate 1 samples',nt_controls = TRUE)
+# dipg_nt_control_read_distribution_rep2 <- read_distribution_plotter(raw_counts,rep2_samples, 'Distribution of raw read counts of non-targeting gRNAs for replicate 2 samples',nt_controls = TRUE)
+# print(dipg_nt_control_read_distribution_rep1)
+# print(dipg_nt_control_read_distribution_rep2)
+# 
+# dipg_read_distribution_rep1_norm <- read_distribution_plotter(norm_counts,rep1_samples,'Distribution of normalised read counts for replicate 1 samples')
+# dipg_read_distribution_rep2_norm <- read_distribution_plotter(norm_counts,rep2_samples,'Distribution of normalised read counts for replicate 2 samples')
+# print(dipg_read_distribution_rep1_norm)
+# print(dipg_read_distribution_rep2_norm)
+# 
+# dipg_nt_control_read_distribution_rep1_norm <- read_distribution_plotter(norm_counts,rep1_samples, 'Distribution of normalised read counts of non-targeting gRNAs for replicate 1 samples',nt_controls = TRUE)
+# dipg_nt_control_read_distribution_rep2_norm <- read_distribution_plotter(norm_counts,rep2_samples, 'Distribution of normalised read counts of non-targeting gRNAs for replicate 2 samples',nt_controls = TRUE)
+# print(dipg_nt_control_read_distribution_rep1_norm)
+# print(dipg_nt_control_read_distribution_rep2_norm)
+
+```
+
+```{r read_distribution_gRNAs}
+
+gRNAs_distribution_plotter <- function(input_counts, samples_to_include, nt_controls = FALSE){
+  
+  if (nt_controls == TRUE){
+    input_counts <- filter(input_counts, is.na(Gene))
+  }
+  
+  data_list <- vector('list', length(samples_to_include))
+  
+  for (i in seq_along(samples_to_include)){
+    data_list[[i]]  <- input_counts %>%
+    select(sgRNA,Gene,samples_to_include[i]) %>%
+    reshape2::melt() %>%
+    rename(sample = variable, count = value) %>%
+    group_by(Gene, sample)%>%
+    summarise(Gene,
+              sample,
+              count = mean(count)) %>%
+    distinct() %>%
+    #ungroup() %>%
+    #group_by(sample)%>%
+    #filter(rank(unique(Gene), ties.method='min') %% 100 == 0) %>% #Thins down the number of genes plotted/analysed to a subset of 20k genes
+    mutate(CellLine = case_when(str_detect(sample,'CON')~'K27M',
+                                str_detect(sample,'KO')~'K27M-KO',
+                                str_detect(sample,'Plasmid')~'Plasmid')) %>%
+    mutate(CellLine = factor(CellLine, levels=c('Plasmid','K27M','K27M-KO'), ordered=TRUE)) %>%
+    mutate(Timepoint = case_when(str_detect(sample,'(d0)|(Plasmid)')~'0',
+                                 str_detect(sample,'d11')~'11',
+                                 str_detect(sample,'d21')~'21',
+                                 )) %>%
+    mutate(Replicate = case_when(str_detect(sample,'r1')~'1',
+                                 str_detect(sample,'r2')~'2',
+                                 TRUE ~ '1')) %>%
+    ungroup()
+  }
+  
+  if (str_detect(samples_to_include[2],'CON')){
+    colour_labels <- c('Plasmid','K27M')
+    colour_values <- c('#66c2a5','#fc8d62')
+  } else if(str_detect(samples_to_include[2], 'KO')){
+    colour_labels <- c('Plasmid','K27M-KO')
+    colour_values <- c('#66c2a5','#8da0cb')
+  }
+
+  read_distribution <- ggplot() +
+    geom_line(data = data_list[[1]],aes(x=as.numeric(reorder(Gene, -count)), y=count,col=CellLine, linetype=Timepoint)) +
+    geom_line(data = data_list[[2]],aes(x=as.numeric(reorder(Gene, -count)), y=count,col=CellLine, linetype=Timepoint)) +
+    geom_line(data = data_list[[3]],aes(x=as.numeric(reorder(Gene, -count)), y=count,col=CellLine, linetype=Timepoint)) +
+    geom_line(data = data_list[[4]],aes(x=as.numeric(reorder(Gene, -count)), y=count,col=CellLine, linetype=Timepoint)) +
+    labs(x='Genes', y='Read Count', 
+       title=str_wrap('Distribution of read counts over all genes for replicate 1 samples indicates similar shape over time', width = 65))+
+    scale_colour_manual(labels=colour_labels, values=colour_values)+
+    scale_linetype_manual(labels = c('Baseline', 'Midpoint', 'Endpoint'), values=c('solid', 'dashed', 'dotted'))+
+    theme(axis.text.x =element_blank(),
+          axis.ticks.x=element_blank(),
+          legend.title=element_blank())
+  
+  print(read_distribution)
+  
+  return(read_distribution)
+}
+# combined_CON_gRNAs_distribution <- gRNAs_distribution_plotter(norm_counts,
+#                                                           c('Plasmid','CON_r1_d0','CON_r1_d11','CON_r1_d21'))
+# combined_KO_gRNAs_distribution <- gRNAs_distribution_plotter(norm_counts,
+#                                                              c('Plasmid','KO_r1_d0','KO_r1_d11','KO_r1_d21'))
+                                                            
+```
+
+
+```{r read QC-export, include=FALSE}
+read_QC_plots <- list(dipg_mapping_QC,dipg_zerocount,dipg_giniindex) 
+
+# dipg_read_distribution_rep1,dipg_read_distribution_rep2, dipg_nt_control_read_distribution_rep1,dipg_nt_control_read_distribution_rep2,dipg_read_distribution_rep1_norm,dipg_read_distribution_rep2_norm, dipg_nt_control_read_distribution_rep1_norm,dipg_nt_control_read_distribution_rep2_norm,combined_CON_gRNAs_distribution, combined_KO_gRNAs_distribution)
+multiple_plot_exporter(read_QC_plots, 'dipg_read_qc')
+
+rm(dipg_mapping_QC,dipg_zerocount,dipg_giniindex)
+# dipg_read_distribution_rep1,dipg_read_distribution_rep2, dipg_nt_control_read_distribution_rep1,dipg_nt_control_read_distribution_rep2,dipg_read_distribution_rep1_norm,dipg_read_distribution_rep2_norm, dipg_nt_control_read_distribution_rep1_norm,dipg_nt_control_read_distribution_rep2_norm, combined_CON_gRNAs_distribution, combined_KO_gRNAs_distribution)
+
+rm(read_QC_plots)
+```
+
+
+```{r outlier_thresholding}
+#!Converts values to NA if read > threshold and then converts value of NA to mean for each column
+# Make sure you really need this before you use this code because it uses an arbitrary threshold to define outliers. It is advised to use the outlier thresholding option in MAGeCK.
+
+norm_counts <- norm_counts %>% 
+  expss::na_if(expss::gt(3000))
+
+for (i in seq(3,ncol(norm_counts))){
+  norm_counts[[i]] <- replace_na(norm_counts[[i]], mean(norm_counts[[i]], na.rm=TRUE))
+}
+
+#write_tsv(norm_counts,'count1b.count.normalized_thresholded.txt')
+
+```
+
+## Quality Control: Replicate Level
+
+Such QC aims to check for consistency between biological replicates and involves:
+
+- Distribution of normalised read counts via boxplots; cumulative distribution functions
+  - Expected that replicates have similar distributions
+- Pairwise Pearson correlation of log(read counts) between samples
+  - Expected > 0.8 between bioreplicates and < 0.8 between non bioreplicate samples
+- Principal component analysis (for dimensionality reduction) with visualisation on first 3x pairs of PCs
+  - Expected that bioreplicate samples cluster together
+  
+```{r replicate_level_qc}
+#!Need to define the groups of bioreplicates and the name for each group
+biorep_groups <- list(
+  c('Plasmid'),
+  c('CON_r1_d0','CON_r2_d0'),
+  c('CON_r1_d11','CON_r2_d11'),
+  c('CON_r1_d21','CON_r2_d21'),
+  c('KO_r1_d0','KO_r2_d0'),
+  c('KO_r1_d11','KO_r2_d11'),
+  c('KO_r1_d21','KO_r2_d21')
+  )
+biorep_groupnames <- c(
+  'Plasmid',
+  'Baseline K27M',
+  'Midpoint K27M',
+  'Endpoint K27M',
+  'Baseline K27M-KO',
+  'Midpoint K27M-KO',
+  'Endpoint K27M-KO'
+)
+
+biorep_annotator <- function(input_norm_counts, samples_to_include, biorep_group_names){ #Ensure that samples to include is a list with character vectors containing names of bioreplicates
+  
+  all_samples <- flatten_chr(samples_to_include)
+  
+  norm_counts <- input_norm_counts %>%
+    select(Gene, sgRNA, contains(all_of(all_samples))) %>%
+    reshape2::melt() %>%
+    rename(sample=  variable, norm_count = value)
+    
+  
+  #Max seven biorep groups (add more if needed) corresponding to baseline; midpoint; endpoint
+  if (length(samples_to_include) == 1){
+    norm_counts <- norm_counts %>%
+       mutate(biorep_group = case_when(
+        sample %in% samples_to_include[[1]] ~ 1
+        ))
+  } else if (length(samples_to_include) == 2){
+      norm_counts <- norm_counts %>%
+        mutate(biorep_group = case_when(
+            sample %in% samples_to_include[[1]] ~ 1,
+            sample %in% samples_to_include[[2]] ~ 2
+           ))
+  } else if (length(samples_to_include) == 3){
+      norm_counts <- norm_counts %>%
+        mutate(biorep_group = case_when(
+            sample %in% samples_to_include[[1]] ~ 1,
+            sample %in% samples_to_include[[2]] ~ 2,
+            sample %in% samples_to_include[[3]] ~ 3
+         ))
+      
+  } else if (length(samples_to_include) == 4){
+      norm_counts <- norm_counts %>%
+        mutate(biorep_group = case_when(
+            sample %in% samples_to_include[[1]] ~ 1,
+            sample %in% samples_to_include[[2]] ~ 2,
+            sample %in% samples_to_include[[3]] ~ 3,
+            sample %in% samples_to_include[[4]] ~ 4
+         ))
+      
+  } else if (length(samples_to_include) == 5){
+      norm_counts <- norm_counts %>%
+        mutate(biorep_group = case_when(
+            sample %in% samples_to_include[[1]] ~ 1,
+            sample %in% samples_to_include[[2]] ~ 2,
+            sample %in% samples_to_include[[3]] ~ 3,
+            sample %in% samples_to_include[[4]] ~ 4,
+            sample %in% samples_to_include[[5]] ~ 5
+         ))
+      
+  } else if (length(samples_to_include) == 6){
+      norm_counts <- norm_counts %>%
+        mutate(biorep_group = case_when(
+            sample %in% samples_to_include[[1]] ~ 1,
+            sample %in% samples_to_include[[2]] ~ 2,
+            sample %in% samples_to_include[[3]] ~ 3,
+            sample %in% samples_to_include[[4]] ~ 4,
+            sample %in% samples_to_include[[5]] ~ 5,
+            sample %in% samples_to_include[[6]] ~ 6
+         ))
+  }  else if (length(samples_to_include) == 7){ #If plasmid included
+      norm_counts <- norm_counts %>%
+        mutate(biorep_group = case_when(
+            sample %in% samples_to_include[[1]] ~ 0,
+            sample %in% samples_to_include[[2]] ~ 1,
+            sample %in% samples_to_include[[3]] ~ 2,
+            sample %in% samples_to_include[[4]] ~ 3,
+            sample %in% samples_to_include[[5]] ~ 4,
+            sample %in% samples_to_include[[6]] ~ 5,
+            sample %in% samples_to_include[[7]] ~ 6
+         ))
+  }else {
+    print('You need to alter function to accept more biorep groups')
+  }
+  
+  norm_counts$biorep_group <- factor(norm_counts$biorep_group, seq(0,length(samples_to_include)))
+  
+  norm_counts <-mutate(norm_counts, Replicate = case_when(str_detect(sample,'r1')~'1',
+                                 str_detect(sample,'r2')~'2',
+                                 TRUE ~ '0')) #Adds 0 for Plasmid 
+  
+  return(norm_counts)
+  
+}
+  
+biorep_norm_read_dist_plotter <- function(norm_counts, samples_to_include, biorep_group_names, prefix){ #Ensure that samples to include is a list with character vectors containing names of bioreplicates
+  
+  #Filter out plasmid
+  norm_counts <- norm_counts %>%
+    filter(!str_detect(sample,'Plasmid'))
+  
+  biorep_freqpoly_distribution <- ggplot(norm_counts, aes(x=norm_count))+
+    geom_freqpoly(aes(col=biorep_group,linetype = Replicate))+
+    scale_colour_brewer(name='Bioreplicate Group', type='qual',palette='Set2', labels=biorep_group_names)+
+    scale_linetype_manual(name = 'Replicate', values = c('solid','dotted'))+
+    xlab('Counts per gRNA')+
+    ylab('Frequency')+
+    labs(title=str_wrap('Bioreplicates have similar frequency distributions of normalised read count', width = 65))+
+    theme(legend.text = element_text(),
+          text = element_text(size = 16))+
+    scale_x_continuous(limits=c(0,2000))
+  
+  print(biorep_freqpoly_distribution)
+  #ggsave(paste(prefix,'biorep_freqpoly_distribution.png',sep='_'), biorep_freqpoly_distribution)
+  
+  biorep_boxplot_distribution <- ggplot(norm_counts, aes(x=sample, y=norm_count))+
+    geom_boxplot(aes(fill=biorep_group))+
+    geom_signif(comparisons=samples_to_include, test='wilcox.test', map_signif_level = TRUE)+
+    scale_fill_brewer(name='Bioreplicate Group', type='qual',palette='Set2', labels=biorep_group_names)+
+    xlab('Replicate Number')+
+    ylab('Counts per gRNA')+
+    labs(title=str_wrap('Boxplot of normalised read counts shows visually similar but statistically dissimilar reads between bioreplicates', width = 65),
+         caption = 'Statistical test via Wilcoxon Rank Sum test')+
+    theme(legend.text = element_text(),
+                       text = element_text(size = 16))+
+  scale_x_discrete(labels = rep(c('1','2'),6))
+                              
+   
+  
+  print(biorep_boxplot_distribution)
+  #ggsave(paste(prefix,'biorep_boxplot_distribution.png',sep='_'), biorep_boxplot_distribution)
+  
+  return(list(biorep_freqpoly_distribution, biorep_boxplot_distribution))
+    
+}
+
+pairwise_correlation_plotter <- function(norm_counts, samples_to_include, biorep_group_names, prefix){
+  
+#!Filter out plasmid
+  norm_counts <- select(norm_counts,1:14)
+  
+  cor_matrix <- norm_counts %>%
+    select(flatten_chr(samples_to_include)) %>%
+    log10() %>%
+    filter(CON_r1_d11 != -Inf,
+           KO_r2_d21 != -Inf)
+    
+  
+  cor_values <- cor(cor_matrix, use='complete.obs')
+  
+  #Reorders the correlation matrix via hierarchial clustering to group similar correlation coefficients together
+  #cor_distance <- as.dist((1-cor_values)/2)
+  #hier_cluster <- hclust(cor_distance)
+  #cor_values <- cor_values[hier_cluster$order, hier_cluster$order]
+  
+  cor_values[upper.tri(cor_values)] <- NA #Only taking one half of the correlation matrix given its reflection
+  cor_values <- melt(cor_values, na.rm=TRUE) %>%
+    mutate(Group = case_when(
+      str_detect(Var2, 'CON_r1_d0') & str_detect(Var1, 'CON_r2_d0')~'biorep',
+      str_detect(Var2, 'CON_r1_d11') & str_detect(Var1, 'CON_r2_d11')~'biorep',
+      str_detect(Var2, 'CON_r1_d21') & str_detect(Var1, 'CON_r2_d21')~'biorep',
+      str_detect(Var2, 'KO_r1_d0') & str_detect(Var1, 'KO_r2_d0')~'biorep',
+      str_detect(Var2, 'KO_r1_d11') & str_detect(Var1, 'KO_r2_d11')~'biorep',
+      str_detect(Var2, 'KO_r1_d21') & str_detect(Var1, 'KO_r2_d21')~'biorep',
+      str_detect(Var2, 'CON_r1_d0') & str_detect(Var1, 'KO_r1_d0')~'baseline',
+      str_detect(Var2, 'CON_r1_d0') & str_detect(Var1, 'KO_r2_d0')~'baseline',
+      str_detect(Var2, 'CON_r2_d0') & str_detect(Var1, 'KO_r1_d0')~'baseline',
+      str_detect(Var2, 'CON_r2_d0') & str_detect(Var1, 'KO_r2_d0')~'baseline',
+
+      TRUE ~ 'neither'
+    )) %>%
+    mutate(Group = factor(Group, levels=c('neither','biorep','baseline'), ordered=TRUE))
+  
+  pairwise_cor_plot <- ggplot(cor_values, aes(Var1, Var2, fill=value))+
+    geom_tile(aes(col=Group),lwd=0.5, show.legend = FALSE)+
+    scale_colour_manual(values=c('white','red', 'purple'))+
+    scale_fill_viridis(limits=c(0,1), name='Pearson Correlation')+
+    labs(title=str_wrap('Pairwise Pearson correlation coefficients between samples show strong correlation between bioreplicates', width=65),
+         #subtitle=str_wrap('Red-lined tiles show correlation between bioreplicates and within Day 0 samples',width=65)
+         ) +
+    geom_text(aes(label=round(value,3)), colour = 'black')+
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          axis.ticks = element_blank(),
+          legend.direction='horizontal',
+          axis.text.x=element_text(angle=90),
+                       text = element_text(size = 16))+
+  scale_x_discrete(labels = c('K27M Day 0 (R1)','K27M Day 0 (R2)',
+                              'K27M Day 11 (R1)','K27M Day 11 (R2)',
+                              'K27M Day 21 (R1)','K27M Day 21 (R2)',
+                              'KO Day 0 (R1)','KO Day 0 (R2)',
+                              'KO Day 11 (R1)','KO Day 11 (R2)',
+                              'KO Day 21 (R1)','KO Day 21 (R2)'))+
+    scale_y_discrete(labels = c('K27M Day 0 (R1)','K27M Day 0 (R2)',
+                              'K27M Day 11 (R1)','K27M Day 11 (R2)',
+                              'K27M Day 21 (R1)','K27M Day 21 (R2)',
+                              'KO Day 0 (R1)','KO Day 0 (R2)',
+                              'KO Day 11 (R1)','KO Day 11 (R2)',
+                              'KO Day 21 (R1)','KO Day 21 (R2)'))
+    
+    guides(fill = guide_colourbar(barheight = 1, barwidth = 5, title.position='top', title.hjust=0.5))
+  
+    #ggsave(paste(prefix,'pairwise_correlation_plot.png', sep='_'), pairwise_cor_plot)
+  
+  print(pairwise_cor_plot)
+  return(pairwise_cor_plot)
+}
+
+
+biorep_norm_counts <- biorep_annotator(norm_counts, biorep_groups, biorep_groupnames) #Melts the normalised read count table and adds a biorep group column
+
+biorep_norm_plots <- biorep_norm_read_dist_plotter(biorep_norm_counts, biorep_groups[2:7], biorep_groupnames[2:7], prefix='dipg')
+biorep_correlation_matrix <- pairwise_correlation_plotter(norm_counts, biorep_groups[2:7], biorep_groupnames[2,7], prefix='dipg')
+```
+
+```{r biorep_pca}
+row_biorep_group <- sort(c(0,seq(1,6),seq(1,6))) #0 refers to the plasmid
+row_biorep_replicate_number <- c(0,rep(seq(1,2),6)) #0 refers to the plasmid
+
+biorep_pca_output <- function(input_norm_counts){
+  
+    num_na_values <- sum(is.na(input_norm_counts$norm_count))
+    print(paste('Number of NA values to be removed from biorep_norm_counts is', as.character(num_na_values)))
+  
+    pre_transposed_norm_counts <<- input_norm_counts %>%
+    drop_na(norm_count) %>% #Filter out NA values
+    select(sgRNA, sample, norm_count)
+      
+    transposed_norm_counts <<- pre_transposed_norm_counts %>%
+      pivot_wider(names_from = sgRNA, values_from = norm_count, values_fill=mean(pre_transposed_norm_counts$norm_count, na.rm=TRUE)) %>% #Replace NA outlier values with mean count value
+      column_to_rownames(var='sample')
+    
+    row_samplenames <<- rownames(transposed_norm_counts) 
+    pca_bioreps <- prcomp(transposed_norm_counts, scale=TRUE)
+    
+    return(pca_bioreps)
+}
+
+
+biorep_pca_scree_plotter <- function(pca_bioreps){
+  
+  pca_var_explained <<- pca_bioreps$sdev^2/sum(pca_bioreps$sdev^2)
+  
+  scree_tb <- tibble('PC' = as.factor(seq(1,length(pca_var_explained))),
+                     'variance' = pca_var_explained)
+  
+  scree_plot <- ggplot(scree_tb, aes(PC, variance * 100))+
+    geom_col()+
+    labs(x='Principal Component', y='Percentage of Variance Explained',
+         title=str_wrap('Scree plot of principal component analysis of all samples shows explanation of majority of variance by first three principal components', width = 65))+
+    theme(text = element_text(size = 16))
+  
+  print(scree_plot)
+  
+  return(scree_plot)
+}
+
+pca_pairwise_plotter <- function(pca, num_pcs_interest){
+  
+  pc <- as_tibble(pca$x) %>%
+    select(1:num_pcs_interest)
+  
+  combinations <- combn(num_pcs_interest,2)
+  
+  pairwise_plots <- vector('list', ncol(combinations))
+  
+  for (i in seq(1,ncol(combinations))){
+    subsetted_pc <- select(pc,combinations[,i]) %>%
+      cbind(row_samplenames) %>%
+      cbind(row_biorep_group)%>%
+      cbind(row_biorep_replicate_number)
+    
+    pairwise_plots[[i]] <- ggplot(subsetted_pc,aes(subsetted_pc[[1]],subsetted_pc[[2]]))+
+      geom_point(aes(col=as.factor(row_biorep_group)))+
+      #geom_text_repel(aes(label=row_biorep_replicate_n))+
+      xlab(paste(colnames(subsetted_pc)[[1]],': ',
+                 as.character(round(pca_var_explained[combinations[1,i]]*100)),'% variance explained',sep=''))+
+      ylab(paste(colnames(subsetted_pc)[[2]],': ',
+                 as.character(round(pca_var_explained[combinations[2,i]]*100)),'% variance explained',sep=''))+
+      scale_colour_brewer(name='Bioreplicate Group', labels=biorep_groupnames, type = 'qual', palette='Set2')+
+      labs(title=str_wrap(paste('Biplot of principal components', colnames(subsetted_pc)[[1]], 'and', colnames(subsetted_pc)[[2]],'shows variable clustering of replicates'), width = 65))+
+      theme(text = element_text(size = 16))
+    
+    print(pairwise_plots[[i]])
+    
+    pdf(paste('pca_pairwise_plot',as.character(i),'.pdf',sep=''))
+    print(pairwise_plots[[i]])
+    dev.off()
+    
+  }
+
+}
+
+biorep_pca <- biorep_pca_output(biorep_norm_counts)
+biorep_scree <- biorep_pca_scree_plotter(biorep_pca)
+pca_pairwise_plotter(biorep_pca,3)
+```
+
+
+```{r replicate_level_qc_export}
+biorep_qc_plots <- list(biorep_norm_plots[[1]], biorep_norm_plots[[2]], biorep_correlation_matrix, biorep_scree #biorep_pairwise_plots[[1]], biorep_pairwise_plots[[2]], biorep_pairwise_plots[[3]]
+                        )
+
+multiple_plot_exporter(biorep_qc_plots, 'biorep_qc_plots')
+
+rm(biorep_qc_plots)
+rm(biorep_norm_plots, biorep_correlation_matrix,biorep_scree, biorep_pairwise_plots)
+
+```
+  
+
+## Quality Control: Gene Level
+
+Such QC can be provided via analysis of the counts for the non-targeting control gRNAs in the non-normalised count.txt across the different samples to ensure sufficiently even distribution from both baseline to endpoint samples. This provides a negative control.
+
+The corollary positive control looks at the counts and beta-scores for the known essential genes (from DepMap) and from functional enrichment analyses (implicating such genes in ribosomal; spliceosomal function) to check that such genes are depleted from the baseline to endpoint samples.
+
+```{r qc_gene_level}
+
+nt_control_distribution_plotter <- function(input_norm_counts, ctrlname, samplename, samples_to_include, baseline, midpt, endpt){
+  
+ctrl_baseline_r1 <- paste(ctrlname,'r1',baseline,sep='_')
+  ctrl_midpt_r1 <-paste(ctrlname,'r1',midpt,sep="_")
+  ctrl_endpt_r1 <- paste(ctrlname,'r1',endpt,sep='_')
+  sample_baseline_r1 <- paste(samplename,'r1',baseline,sep='_')
+  sample_midpt_r1 <-paste(samplename,'r1',midpt,sep="_")
+  sample_endpt_r1 <- paste(samplename,'r1',endpt,sep='_')
+  
+  ctrl_baseline_r2 <- paste(ctrlname,'r2',baseline,sep='_')
+  ctrl_midpt_r2 <-paste(ctrlname,'r2',midpt,sep="_")
+  ctrl_endpt_r2 <- paste(ctrlname,'r2',endpt,sep='_')
+  sample_baseline_r2 <- paste(samplename,'r2',baseline,sep='_')
+  sample_midpt_r2 <-paste(samplename,'r2',midpt,sep="_")
+  sample_endpt_r2 <- paste(samplename,'r2',endpt,sep='_')
+  
+  nt_control_counts <- input_norm_counts %>%
+    filter(is.na(Gene)) %>%
+    select(samples_to_include) %>%
+    reshape2::melt() %>%
+    rename(sample = variable, count = value) %>%
+    mutate(CellLine = case_when(str_detect(sample,ctrlname)~'K27M', str_detect(sample,samplename)~'K27M-KO'))
+  
+  read_distribution <- ggplot(nt_control_counts, aes(x=sample, y=count)) +
+    geom_boxplot(aes(fill=CellLine), alpha=0.75) +
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r1, ctrl_endpt_r1),c(sample_baseline_r1, sample_endpt_r1))
+                  ,test=(wilcox.test),test.args =c(alternative='two.sided'), map_signif_level = TRUE, margin_top = 0.2)+
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r1,ctrl_midpt_r1),
+                       c(ctrl_midpt_r1,ctrl_endpt_r1),
+                       c(sample_baseline_r1,sample_midpt_r1),
+                       c(sample_midpt_r1,sample_endpt_r1)
+                       )
+                  ,test=(wilcox.test),test.args =c(alternative='two.sided'), map_signif_level = TRUE)+
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r2, ctrl_endpt_r2),c(sample_baseline_r2, sample_endpt_r2))
+                  ,test=(wilcox.test),test.args =c(alternative='two.sided'), map_signif_level = TRUE, margin_top = 0.2)+
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r2,ctrl_midpt_r2),
+                       c(ctrl_midpt_r2,ctrl_endpt_r2),
+                       c(sample_baseline_r2,sample_midpt_r2),
+                       c(sample_midpt_r2,sample_endpt_r2)
+                       )
+                  ,test=(wilcox.test),test.args =c(alternative='two.sided'), map_signif_level = TRUE)+
+    scale_fill_brewer(type='qual',palette='Set2')+
+    labs(x='Timepoint', y='Counts per gRNA', 
+       title=str_wrap('Normalised read counts for non-targeting controls are similar from baseline to endpoint samples', width =65),
+       caption='Statistical test via two-sided Wilcoxon Rank Sum Test'
+       #subtitle='R refers to bioreplicate number'
+       )+
+    theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=60, vjust = +0.5))+
+    scale_x_discrete(labels=c('Day 0 (R1)','Day 11 (R1)', 'Day 21 (R1)' ,
+                              'Day 0 (R1)','Day 11 (R1)', 'Day 21 (R1)' ,
+                              'Day 0 (R2)','Day 11 (R2)', 'Day 21 (R2)',
+                              'Day 0 (R2)','Day 11 (R2)', 'Day 21 (R2)'))
+    
+  print(read_distribution)
+  return(read_distribution)
+  
+  
+}
+
+positive_control_count_plotter <- function(input_normalised_counts,ctrlname, samplename, samples_to_include, baseline, midpt, endpt, depmap_or_tsg){
+  
+  ctrl_baseline_r1 <- paste(ctrlname,'r1',baseline,sep='_')
+  ctrl_midpt_r1 <-paste(ctrlname,'r1',midpt,sep="_")
+  ctrl_endpt_r1 <- paste(ctrlname,'r1',endpt,sep='_')
+  sample_baseline_r1 <- paste(samplename,'r1',baseline,sep='_')
+  sample_midpt_r1 <-paste(samplename,'r1',midpt,sep="_")
+  sample_endpt_r1 <- paste(samplename,'r1',endpt,sep='_')
+  
+  ctrl_baseline_r2 <- paste(ctrlname,'r2',baseline,sep='_')
+  ctrl_midpt_r2 <-paste(ctrlname,'r2',midpt,sep="_")
+  ctrl_endpt_r2 <- paste(ctrlname,'r2',endpt,sep='_')
+  sample_baseline_r2 <- paste(samplename,'r2',baseline,sep='_')
+  sample_midpt_r2 <-paste(samplename,'r2',midpt,sep="_")
+  sample_endpt_r2 <- paste(samplename,'r2',endpt,sep='_')
+  
+  if (depmap_or_tsg == 'depmap'){
+    plot_counts <- input_normalised_counts %>%
+      filter(Gene %in% common_essentials$gene)
+  } else if (depmap_or_tsg == 'tsg'){
+        plot_counts <- input_normalised_counts %>%
+      filter(Gene %in% tsgenes$gene)
+  }
+  plot_counts <- plot_counts %>%
+    select(samples_to_include) %>%
+    reshape2::melt() %>%
+    rename(sample=variable, count=value) %>%
+    mutate(CellLine = case_when(str_detect(sample,ctrlname)~'K27M', str_detect(sample,samplename)~'K27M-KO'))
+  
+  
+  read_distribution <- ggplot(plot_counts,aes(x=sample, y=count)) +
+    geom_boxplot(aes(fill=CellLine), alpha=0.75) +
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r1, ctrl_endpt_r1),c(sample_baseline_r1, sample_endpt_r1))
+                  ,test=(wilcox.test),test.args =c(alternative='greater'), map_signif_level = TRUE, margin_top = 0.2)+
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r1,ctrl_midpt_r1),
+                       c(ctrl_midpt_r1,ctrl_endpt_r1),
+                       c(sample_baseline_r1,sample_midpt_r1),
+                       c(sample_midpt_r1,sample_endpt_r1)
+                       )
+                  ,test=(wilcox.test),test.args =c(alternative='greater'), map_signif_level = TRUE)+
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r2, ctrl_endpt_r2),c(sample_baseline_r2, sample_endpt_r2))
+                  ,test=(wilcox.test),test.args =c(alternative='greater'), map_signif_level = TRUE, margin_top = 0.2)+
+    geom_signif(comparisons=
+                  list(c(ctrl_baseline_r2,ctrl_midpt_r2),
+                       c(ctrl_midpt_r2,ctrl_endpt_r2),
+                       c(sample_baseline_r2,sample_midpt_r2),
+                       c(sample_midpt_r2,sample_endpt_r2)
+                       )
+                  ,test=(wilcox.test),test.args =c(alternative='greater'), map_signif_level = TRUE)+
+    scale_fill_brewer(type='qual',palette='Set2')+
+    labs(x='Timepoint', y='Counts per gRNA', 
+       title=str_wrap('Normalised read counts of DepMap common essential genes decrease significantly from baseline to endpoint samples', width =65),
+       caption='Statistical test via one-sided Wilcoxon Rank Sum Test'
+       #subtitle='R refers to bioreplicate number'
+       )+
+    theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle=60, vjust = +0.5))+
+    scale_x_discrete(labels=c('Day 0 (R1)','Day 11 (R1)', 'Day 21 (R1)' ,
+                              'Day 0 (R1)','Day 11 (R1)', 'Day 21 (R1)' ,
+                              'Day 0 (R2)','Day 11 (R2)', 'Day 21 (R2)',
+                              'Day 0 (R2)','Day 11 (R2)', 'Day 21 (R2)'))
+  
+  print(read_distribution)
+  
+  return(read_distribution)
+}
+
+dipg_nt_control_counts<- nt_control_distribution_plotter(norm_counts, 'CON','KO',c(rep1_samples,rep2_samples),'d0','d11','d21')
+dipg_depmap_control_counts <- positive_control_count_plotter(norm_counts, 'CON','KO',c(rep1_samples,rep2_samples),'d0','d11','d21', 'depmap')
+dipg_tsg_control_counts <- positive_control_count_plotter(norm_counts, 'CON','KO',c(rep1_samples,rep2_samples),'d0','d11','d21', 'tsg')
+
+
+dipg_control_count_plots <- list(dipg_nt_control_counts, dipg_depmap_control_counts, dipg_tsg_control_counts)
+multiple_plot_exporter(dipg_control_count_plots, 'dipg_control_counts')
+
+rm(dipg_nt_control_counts, dipg_depmap_control_counts)
+rm(dipg_control_count_plots)
+
+```
+
+```{r read_count_over_time}
+# counts_boxplot_plotter <- function(input_raw_counts, ctrlname, samplename, samples_to_include, baseline, midpt, endpt){
+#   
+#   ctrl_baseline <- paste(ctrlname,baseline,sep='_')
+#   ctrl_midpt <- paste(ctrlname,midpt,sep="_")
+#   ctrl_endpt <- paste(ctrlname,endpt,sep='_')
+#   sample_baseline <- paste(samplename,baseline,sep='_')
+#   sample_midpt <-paste(samplename,midpt,sep="_")
+#   sample_endpt <- paste(samplename,endpt,sep='_')
+#   
+#   counts <- input_raw_counts %>%
+#     select(samples_to_include) %>%
+#     reshape2::melt() %>%
+#     rename(sample = variable, count = value) %>%
+#     mutate(CellLine = case_when(str_detect(sample,ctrlname)~ctrlname, str_detect(sample,samplename)~samplename))
+#   
+#   read_distribution <- ggplot(counts, aes(x=sample, y=count)) +
+#     geom_boxplot(aes(fill=CellLine), alpha=0.75) +
+#     geom_signif(comparisons=
+#                   list(c(ctrl_baseline, ctrl_endpt),c(sample_baseline, sample_endpt))
+#                   ,test=(wilcox.test),test.args =c(alternative='two.sided'), map_signif_level = TRUE, margin_top = 0.2)+
+#     geom_signif(comparisons=
+#                   list(c(ctrl_baseline,ctrl_midpt),
+#                        c(ctrl_midpt,ctrl_endpt),
+#                        c(sample_baseline,sample_midpt),
+#                        c(sample_midpt,sample_endpt)
+#                        )
+#                   ,test=(wilcox.test),test.args =c(alternative='two.sided'), map_signif_level = TRUE)+
+#     scale_fill_brewer(type='qual',palette='Set2')+
+#     labs(x='Sample', y='Count', 
+#        title=str_wrap(paste('Read counts for all genes over all samples of bioreplicate',substr(baseline,2,2)), width =75),
+#        caption='Statistical test via two-sided Wilcoxon Rank Sum Test')+
+#     theme(legend.title = element_blank())
+#   
+#   return(read_distribution)
+# }
+# 
+# counts_boxplot_rep1 <- counts_boxplot_plotter(norm_counts, 'CON','KO',rep1_samples,'r1_d0','r1_d11','r1_d21')
+# counts_boxplot_rep2 <- counts_boxplot_plotter(norm_counts, 'CON','KO',rep2_samples,'r2_d0','r2_d11','r2_d21')
+# 
+# print(counts_boxplot_rep1)
+# print(counts_boxplot_rep2)
+# 
+# multiple_plot_exporter(list(counts_boxplot_rep1,counts_boxplot_rep2), 'counts_replicates_boxplots')
+# rm(counts_boxplot_rep1, counts_boxplot_rep2)
+# 
+
+```
+
+
+## Downstream Functional Analysis with MAGeCKFlute
+
+This uses functions of the *MAGeCKFlute* package @Wang2019 to run downstream QC and functional analysis of the results from MAGeCK MLE.
+For reference, the beta score from MAGeCK-MLE provides a measure of selection (+ve scores reflect positive selection and vice versa).
+
+```{r import_mle}
+#! Need to define your MAGeCK mle derived gene_summary.txt here
+mle_gene_summary <- gene_summary_importer('mle2b.gene_summary.txt',working_directory)
+mle_dipg_essential <- gene_summary_importer('dipg_essential_v2.gene_summary.txt',working_directory)
+
+#! This is not required if you don't want to change the column names
+column_names <-colnames(mle_gene_summary)
+column_names <- str_replace(column_names,'CON3','CON') 
+column_names <- str_replace(column_names,'KO2','KO')
+colnames(mle_gene_summary) <- column_names
+
+#! Need to define your MAGeCK mle derived gene_summary.txt here
+mle_betas <- ReadBeta(paste(working_directory,'mle2b.gene_summary.txt', sep='/')) %>%
+  #!Below code not required if you don't want to change column names
+  rename(CON=CON3, KO=KO2)
+```
+
+### Beta Normalisation via Core Essential Genes 
+
+Different cell lines and different conditions may impact the doubling times so comparing cell lines/conditions with different proliferation rates may lead to inherent biases. For example, cell lines with faster doubling times will have more generations so will have greater magnitude of selection for or against their KO mutation.
+
+This differential proliferation rate can be accounted for by normalising the beta-values for all cell lines/conditions using a list of 625 core essential genes, assuming that they are equally negatively selected against in all lines/conditions. This is achieved by
+
+1. Calculating the median beta-score from beta-scores for the 625 core essential genes across all conditions
+2. Normalising all beta-scores for all genes across all conditions by dividing by the median calculated in 1)
+
+This normalisation allows comparison between the different cell lines and conditions.
+
+```{r beta_normalisation}
+#!Define your control and sample condition names
+ctrlname <- 'CON'
+samplename <- 'KO'
+
+#Adds column with Human equivalent gene ID though some genes will have NA values
+mle_betas$HumanGene = TransGeneID(mle_betas$Gene, fromType = "symbol", toType = "symbol")
+
+#Performs median normalisation of beta values using the median value of the core essential genes of cell cycle
+#!Need to alter samples() argument to specify which conditions i.e columns in mle_betas you want to normalise for.
+mle_betas_cc = NormalizeBeta(mle_betas, id = "HumanGene", samples=c(ctrlname, samplename,'d11','d21'), 
+                         method="cell_cycle")
+```
+
+### Visualisation of Normalised Beta Values
+
+After normalisation, the distributions of beta values should be similar across all cell lines/conditions. This can be assessed via:
+
+1. Density plot for beta scores of conditions 1 and 2
+2. Density plot for differences in beta scores between conditions 1 and 2
+3. Comparison plot of beta scores for condition 1 vs. condition 2
+
+N.B This code works but isn't used very much!
+
+```{r normalisation_visualiser}
+density_beta_normalised_plotter <- function(normalised_betas,ctrlname, samplename, titl,capt='',filename, prefix){
+  
+  melted_df <- reshape2::melt(normalised_betas) %>%
+    rename(CellLine = variable, beta = value)
+  
+  density_beta <- ggplot(melted_df)+
+    geom_density(aes(beta, col=CellLine))+
+    labs(title=str_wrap(titl, width=65), caption=str_wrap(capt,width=60))+
+    xlab('Beta score')+
+    ylab('Density')+
+    scale_colour_brewer(type='qual', palette='Set2')+
+    theme(legend.title = element_blank())
+    
+  #ggsave(paste(prefix,filename,sep='_'), density_beta)
+  
+  return(density_beta)
+}
+
+density_diff_beta_normalised_plotter <- function(normalised_betas,ctrlname, samplename, titl,capt='',filename, prefix){
+  
+  diff_df <- normalised_betas %>%
+    mutate(diff = normalised_betas[,3] - normalised_betas[,2]) %>%
+    select(Gene, HumanGene, diff)
+  
+  melted_df <- reshape2::melt(diff_df) %>%
+    rename(CellLine = variable, diff=value)
+  
+  density_diff_beta <- ggplot(melted_df)+
+    geom_density(aes(diff))+
+    labs(title=str_wrap(titl, width=65), caption=str_wrap(capt,width=60))+
+    xlab('Difference in beta scores for sample vs. control')+
+    ylab('Density')+
+    theme(legend.title = element_blank())+
+    stat_function(fun=dnorm, args=list(mean=mean(melted_df$diff),sd=sd(melted_df$diff)), col='red', linetype=2)+
+    geom_vline(xintercept=0,linetype=2, col='black')
+    
+  #ggsave(paste(prefix,filename,sep='_'), density_diff_beta)
+  
+  return(density_diff_beta)
+}
+comparative_beta_plotter <- function(normalised_betas,ctrlname, samplename, titl,capt='',filename, prefix){
+
+  control <- sym(ctrlname) #Enables passing of function arguments to ggplot
+  sample <- sym(samplename)
+  
+  comparative_plot <- ggplot(normalised_betas,aes(x=!!control, y=!!sample))+
+    geom_point(alpha=0.5, col='black')+
+    labs(title=str_wrap(titl, width=65), caption=str_wrap(capt,width=60))+
+    xlab(paste(ctrlname,'beta scores'))+
+    ylab(paste(samplename, 'beta scores'))+
+    theme(legend.title = element_blank())+
+    geom_abline(slope=1, intercept=0, col='red', alpha=0.8, linetype=2)+
+    geom_smooth(method='lm')
+  
+  #ggsave(paste(prefix,filename,sep='_'), comparative_plot)
+  
+  return(comparative_plot)
+}
+
+#Repeat each function for the normalised and the non-normalised data to allow comparison
+density_beta_normalised <- density_beta_normalised_plotter(mle_betas_cc, 'CON','KO','Density plot of normalised beta scores for all conditions shows normalisation',filename='beta_normalised_density.png', prefix='dipg')
+density_beta_non_normalised <- density_beta_normalised_plotter(mle_betas, 'CON','KO','Density plot of non-normalised beta scores for all conditions',filename='beta_non_normalised_density.png', prefix='dipg')
+
+density_diff_beta_normalised <- density_diff_beta_normalised_plotter(mle_betas_cc, 'CON','KO','Distribution of deviation in normalised beta scores between CON vs. KO cells tends towards normal distribution',filename='beta_normalised_density_diff.png', prefix='dipg')
+density_diff_beta_non_normalised <- density_diff_beta_normalised_plotter(mle_betas, 'CON','KO','Distribution of deviation in non-normalised beta scores between CON vs. KO cells',filename='beta_non_normalised_density_diff.png', prefix='dipg')
+
+comparative_beta_normalised <- comparative_beta_plotter(mle_betas_cc,'CON','KO','Comparison plot of normalised beta scores indicates ? as trendline (blue) ? towards y=x (red)', filename='beta_normalised_comparative_plot.png', prefix='dipg')
+comparative_beta_non_normalised <- comparative_beta_plotter(mle_betas,'CON','KO','Comparison plot of non-normalised beta scores ?', filename='beta_non_normalised_comparative_plot.png', prefix='dipg')
+
+```
+
+```{r export_normalisation_visualiser}
+normalised_vs_non_normalised <- list(density_beta_normalised, density_beta_non_normalised, density_diff_beta_normalised, density_diff_beta_non_normalised, comparative_beta_normalised, comparative_beta_non_normalised)
+
+multiple_plot_exporter(normalised_vs_non_normalised, 'normalised_vs_non_normalised_betas')
+
+rm(normalised_vs_non_normalised,density_beta_normalised, density_beta_non_normalised, density_diff_beta_normalised, density_diff_beta_non_normalised, comparative_beta_normalised, comparative_beta_non_normalised)
+
+```
+
+### Volcano Plots for Hit Identification per Condition
+
+The below code chunk is deprecated!
+
+```{r volcano_plot_relative_cellline}
+##These DON'T USE NORMALISED BETA-VALUES BTW
+
+volcano_plotter <- function(mle_gene_summary, input_name,comp_name, permutation_or_wald = 'Wald', top = 5, main_title){
+  
+  sample_gene_summary <- mle_gene_summary %>%
+    select(Gene, sgRNA, starts_with(as.character(input_name))) %>%
+    mutate(common_essential = case_when(Gene %in% common_essentials$gene ~ TRUE, TRUE ~ FALSE))
+  
+  if (permutation_or_wald == 'Wald'){
+    mutated_mle_gene_summary <- sample_gene_summary %>%
+      select(Gene, sgRNA, contains('beta'), contains('wald'), common_essential) %>%
+      rename('fdr' = paste(as.character(input_name),'wald-fdr',sep='|')) %>%
+      rename('pval' = paste(as.character(input_name),'wald-p-value',sep='|')) %>%
+      mutate('significant' = case_when(fdr < 0.05 ~ TRUE, fdr >= 0.05 ~ FALSE)) %>%
+      rename('beta' = paste(as.character(input_name),'beta',sep='|')) %>%
+      mutate('beta_rank' = rank(-abs(beta))) %>% # Rank in descending order 
+      mutate('pval_rank' = rank(abs(pval))) # Rank in descending order 
+    
+  }
+  else if (permutation_or_wald == 'Permutation'){
+    mutated_mle_gene_summary <- sample_gene_summary %>%
+      select(!contains('wald')) %>%
+      rename('fdr' = paste(as.character(input_name),'fdr',sep='|')) %>%
+      rename('pval' = paste(as.character(input_name),'p-value',sep='|')) %>%
+      mutate('significant' = case_when(fdr< 0.05 ~ TRUE, fdr >= 0.05 ~ FALSE)) %>%
+      rename('beta' = paste(as.character(input_name),'beta',sep='|')) %>%
+      mutate('beta_rank' = rank(-abs(beta)))%>% # Rank in descending order 
+      mutate('pval_rank' = rank(abs(pval))) # Rank in descending order 
+    
+  } else{
+    print('Need to specify Permutation or Wald')
+  }
+  
+  if (input_name == 'CON' & comp_name == 'KO'){
+    title_input <- 'K27M'
+    title_comp <- 'K27M-KO'
+  } else if (input_name == 'KO' & comp_name == 'CON'){
+    title_input <- 'K27M-KO'
+    title_comp <- 'K27M'
+  }
+
+  volcano <- ggplot(mutated_mle_gene_summary, aes(x=beta, y = -log10(fdr)))+
+    geom_point(aes(col=common_essential),alpha=0.25)+
+    scale_x_continuous(expand=expansion(add=0.5))+
+    scale_colour_manual(name = 'Common Essential?',values=c('#fc8d62','#a6d854'),labels = c('Non Common Essential','Common Essential'))+
+    #scale_alpha_manual(name = 'Statistically Signficant?',values = (c(0.2,0.5)))+
+    geom_hline(aes(yintercept=-log10(0.05), linetype='5% Significance Threshold'), col='red')+
+    geom_vline(xintercept = 0, linetype = 2, alpha = 0.8, col='black')+
+    scale_linetype_manual(name = "Threshold", values = c(2), 
+                          guide = guide_legend(override.aes = list(color = c('red'))))+
+    xlab('Beta Score')+
+    ylab('-Log10 (Adjusted p value)')+
+    labs(title=str_wrap(paste('Volcano plot from',permutation_or_wald, 'test for the', title_input, 'relative to the', title_comp, 'cell line indicates' ,main_title),width=65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')+
+    theme(legend.title = element_blank()) +
+    guides(alpha=FALSE)+ #Removes legend for alpha
+    geom_label_repel(data=filter(mutated_mle_gene_summary, beta_rank <= top | pval_rank <= top), aes(col=common_essential,label = Gene), show.legend=FALSE, max.overlaps=25, force=5, force_pull=0.5
+                     )+
+    scale_y_continuous(breaks=c(0,2,4,6,8,10,12))
+  
+  return(volcano)
+}
+
+# dipg_CON_wald_volcano <- volcano_plotter(mle_gene_summary,'CON','KO', main_title='substantially greater negative selection for several hits including ASCL1', top=3)
+# dipg_KO_wald_volcano <- volcano_plotter(mle_gene_summary,'KO','CON', main_title='substantially greater negative selection against common essential genes',top=3)
+# 
+# print(dipg_CON_wald_volcano)
+# print(dipg_KO_wald_volcano)
+
+#dipg_CON_permutation_volcano <- volcano_plotter(mle_gene_summary,'CON','KO', permutation_or_wald = 'Permutation', main_title='weak selection for or against genes', top=4)
+#dipg_KO_permutation_volcano <- volcano_plotter(mle_gene_summary,'KO','CON',permutation_or_wald = 'Permutation',main_title='substantial degree of selection',top=4)
+
+#print(dipg_CON_permutation_volcano)
+#print(dipg_KO_permutation_volcano)
+
+
+# dipg_volcano_plots <- list(dipg_CON_wald_volcano, dipg_KO_wald_volcano
+#                            #, dipg_CON_permutation_volcano, dipg_KO_permutation_volcano
+#                            )
+# multiple_plot_exporter(dipg_volcano_plots, 'dipg_individual_volcanos')
+# 
+# rm(dipg_volcano_plots,dipg_CON_wald_volcano, dipg_KO_wald_volcano, dipg_CON_permutation_volcano, dipg_KO_permutation_volcano)
+
+```
+
+### Permutation Test for MAGeCK
+
+The below code chunk is deprecated (but it works if you want to run your own permutation test though I would recommend a Wald test instead)!
+
+This statistical test is to test if there is a significant difference for each gene between its CON and KO scores.
+To do this when there is no statistical approximation that would be fully justified (e.g CLT -> normal approximation), you can use permutation (i.e randomly swapping all the Gene labels across all genes to compute difference between CON and KO scores) to generate a null distribution of difference in score.
+Then, you can use this null distribution to see where the observed difference for each gene lies and compute a p-value.
+
+The process is:
+1. Sample randomly from CON pool and sample randomly from KO pool -> compute difference in score
+2. Repeat n times -> null distribution of difference in score for CON vs. KO
+3. Calculate p-value for each gene using the same null distribution using two-sided test (i.e convert diffs to absolute values and calculate proportion of null distribution values > observed difference)
+- Also need to add 1 to both numerator and denominator to avoid misestimation as per Phipson & Smyth, 2010.
+
+```{r permutation_test}
+
+permutation_tester <- function(input_df,n_permutations){
+  
+  set.seed(0)
+  null_diff <- vector('numeric',n_permutations)
+  
+  for (i in seq(n_permutations)){
+    null_diff[i] <- sample(input_df$CON,1)-sample(input_df$KO,1)
+  }
+  
+  null_diff_tb <- tibble(Diff = null_diff)
+  null_diff_pdf <- ggplot(null_diff_tb)+
+    geom_density(aes(x=Diff))+
+    xlab('Difference in Beta Score')+
+    ylab('Density')+
+    labs(title='Probability Density Function of Difference in Beta Scores')+
+    geom_vline(xintercept = 0, linetype='dashed', col='red')+
+    scale_x_continuous(breaks=c(-3,-2,-1,0,1,2,3))
+  
+  print(null_diff_pdf)
+  
+  output_pvals <- input_df %>%
+    select(Gene,CON,KO,common_essential) %>%
+    mutate(Diff = CON - KO) %>%
+    arrange(Gene)
+  
+  pvals <- vector('numeric', length(input_df$Gene))
+  
+  for (i in seq_along(pvals)){
+    diff_value <- abs(output_pvals$Diff[[i]])
+    pvals[i] <- (sum(abs(null_diff)>diff_value)+1) / (length(null_diff)+1) #Calculates p-value of proportion of null distribution with greater absolute value of difference in score with correction as per Phipson & Smyth 2010.
+  }
+  
+  adjusted_pvals <- p.adjust(pvals, method='BH')
+  output_pvals <- cbind(output_pvals, pvals, adjusted_pvals)
+  
+  return(output_pvals)
+  
+}
+
+# permuted_diff_beta <- permutation_tester(mle_betas_cc, 100000)
+
+```
+
+### Wald Test for MAGeCK
+
+You can compute a Wald test (or t-test) for the difference in scores using the z-value given in mle_gene_summary for CON and KO because the z-value i.e test-statistic = beta/se(beta).
+So you compute the new test-statistic of difference in betas as (difference in betas) / (var(beta1) + var(beta2) - 2*covar(beta1, beta2).
+
+The really hard part about this is getting your covariance values between beta1 and beta2. To do this, you need to find the source file for mleem.py and replace it with the included mleem.py in the folder of this script.
+Then you need to run mageck mle again with your original settings but add '>>covar.txt' to the end of the mageck mle ... command in terminal so it outputs the covar to the working directory.
+MAGeCK mle outputs numerous copies of covar to that text because it runs several times - take the last set of covariance values (do this by looking at the first gene and looking for the last instance of it in the file and taking all the values below that) and copy it into Excel to make a .csv for import below.
+
+```{r wald_tester}
+#! Import your covariance.csv file here
+covar <- read_csv(paste(working_directory, 'MAGeCK_CON_KO_covariance.csv', sep='/'), col_names=FALSE) %>%
+  rename(Gene = X1, covar = X2)
+
+#Adding DepMap Common Essential column to data
+mle_betas_cc <- mle_betas_cc %>%
+  mutate(common_essential = case_when(Gene %in% common_essentials$gene ~ TRUE, TRUE ~ FALSE)) 
+
+#This function performs a Wald test on the difference of beta scores vs. 0
+wald_tester <- function(input_mle_betas, input_mle_summary, covariance){
+  
+  se_vals <- input_mle_summary$`CON|beta` / input_mle_summary$`CON|z`
+  
+  output_pvals = input_mle_betas %>%
+    mutate(Diff = CON - KO)
+  
+  output_pvals <- cbind(output_pvals, se_vals, covariance$covar) %>%
+     rename(se = se_vals, covar=`covariance$covar`) %>%
+    mutate(cc_con_var = se^2 * 2.256674^2, #Computing the variance for CON and KO but with the adjustments due to different cell cycle normalisation for CON and KO beta scores
+           cc_ko_var = se^2 * 1.857476^2,
+           wald_z = Diff/sqrt(cc_con_var + cc_ko_var - 2*covar),
+           wald_p = 2*pnorm(abs(wald_z), lower.tail=FALSE))%>%
+        filter(!is.na(Gene))
+  
+  fdr <- p.adjust(output_pvals$wald_p, method='BH')
+  output_pvals <- cbind(output_pvals, fdr)
+
+  return(output_pvals)
+}
+
+#This function plots a volcano plot of the derived Wald values
+wald_volcano_plotter <- function(wald_vals, top){
+  
+  wald_vals <- wald_vals %>%
+    mutate(abs_diff_rank = rank(-abs(Diff)),
+           fdr_rank = rank(fdr),
+           Label = case_when(abs_diff_rank <= top | fdr_rank <= top ~ Gene,
+                             TRUE ~ ''),
+           Group = case_when(common_essential == TRUE ~ 'Common Essential',
+                             common_essential == FALSE & fdr > 0.05 ~ 'None',
+                             common_essential == FALSE & fdr <= 0.05 & Diff < 0 ~ 'K27M-specific Essential',
+                             common_essential == FALSE & fdr <= 0.05 & Diff > 0 ~ 'K27M-KO-specific Essential')) %>%
+    mutate(Group = factor(Group, levels =c('K27M-specific Essential','K27M-KO-specific Essential', 'Common Essential', 'None'), ordered=TRUE))
+  
+  write_tsv(wald_vals,paste('wald_diff_output.tsv'))
+  
+  volcano <- ggplot(wald_vals, aes(x=Diff, y = -log10(fdr)))+
+    geom_point(aes(col=wald_vals$Group),alpha=0.25)+
+    scale_colour_manual(values=c('#e78ac3','#ffd92f','#a6d854','#b3b3b3'), labels=c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential','Common Essential','Insignificant Difference\nin Essentiality'))+
+    scale_x_continuous(expand=expansion(add=0.5))+
+    #scale_alpha_manual(name = 'Statistically Signficant?',values = (c(0.2,0.5)))+
+    geom_hline(aes(yintercept=-log10(0.05), linetype='5% Significance Threshold'), col='red')+
+    geom_vline(xintercept = 0, linetype = 2, alpha = 0.8, col='black')+
+    scale_linetype_manual(name = "Threshold", values = c(2), 
+                          guide = guide_legend(override.aes = list(color = c('red'))))+
+    xlab('Difference in Beta Score')+
+    ylab('- log10 (Adjusted p-value)')+
+    labs(title=str_wrap(paste('Volcano plot from a Wald test of the difference in beta scores between K27M and K27M-KO lines'),width=65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')+
+    theme(legend.title=element_blank(),
+          legend.spacing.y=unit(0.25,'cm'))+
+    guides(colour = guide_legend(byrow = TRUE))+
+    guides(alpha=FALSE)+ #Removes legend for alpha
+    geom_label_repel(aes(label = wald_vals$Label, col=wald_vals$Group), show.legend=FALSE, max.overlaps=25, force=5, force_pull=0.5)
+  
+  print(volcano)
+  return(volcano)
+}
+
+wald_pval_hist_plotter <- function(input_pvals){
+  
+  stat_significant_pvals <- filter(input_pvals, fdr <= 0.05, common_essential==FALSE)
+  
+  pval_hist <- ggplot(stat_significant_pvals, aes(x=-log10(fdr)))+
+    geom_histogram()+
+    xlab(bquote(-log[10]~'(Adjusted p value)'))+
+    ylab('Count')+
+    labs(title=str_wrap('Histogram of FDR values for statistically significant K27M-specific and K27M-KO-specific essential hits from Wald test for significant difference in beta scores in K27M vs. K27M-KO'),width=65)+
+    scale_x_continuous(breaks=seq(0,16,1))
+  
+  print(pval_hist)
+  
+  return(pval_hist)
+}
+  
+wald_pvals <- wald_tester(mle_betas_cc, mle_gene_summary, covar)
+wald_diff_volcano <- wald_volcano_plotter(wald_pvals, 6)
+wald_pval_hist <- wald_pval_hist_plotter(wald_pvals)
+
+multiple_plot_exporter(list(wald_diff_volcano,wald_pval_hist), 'wald_diff_volcano_mageck')
+```
+
+
+### Condition/Cell Type-Specific Hit Identification
+
+This normalisation of beta-score is via the cell cycle genes.
+
+Now that we have checked normalisation of beta scores between all of our conditions/cell lines, we can identify condition/cell type-specific hits - defined as those genes which have substantially different beta scores in one of the two conditions/cell lines.
+
+Below code is depreciated because it uses the quantile normalisation approach! 
+
+```{r condition_specific_hit_identification}
+
+source('./ScatterView.R') #Sourcing source code function of ScatterView() and CutoffCalling() from MAGeCKFlute package
+
+differential_hits_plotter <- function(data, x,y, top, sd_cutoff, prefix){
+  
+  sample <- sym(y)
+  ctrl  <- sym(x)
+  slope <- 1
+  
+  intercept = c(-CutoffCalling(data[,y]-data[,x], sd_cutoff), CutoffCalling(data[,y]-data[,x], sd_cutoff)) #Quantile normalisation to decide arbitray threshold for selection
+  
+  data$common_essential[data$Gene == 'TWISTNB'] <- TRUE
+  
+  data <- data %>%
+    mutate(Group = case_when(!!sample<slope*!!ctrl+min(intercept) ~ 'Lower',
+                             !!sample>slope*!!ctrl+max(intercept) ~ 'Upper',
+                             TRUE~'None')) %>%
+    mutate(Group = case_when(str_detect(Group, 'Lower') & common_essential == TRUE ~ 'Common Essential',
+                             str_detect(Group, 'Upper') & common_essential == TRUE ~ 'Common Essential',
+                             str_detect(Group, 'None') & common_essential == TRUE ~ 'Common Essential',
+                             TRUE~Group)) %>%
+    mutate(Group = factor(Group, levels = c('Lower','Upper','Common Essential', 'None'), ordered=TRUE)) %>%
+    mutate(Diff = !!sample - !!ctrl) %>%
+    mutate(Abs_Diff = abs(Diff)) %>%
+    mutate(Abs_Rank = rank(-Abs_Diff)) %>%
+    mutate(Abs_Label = case_when(Abs_Rank <= top ~ Gene,
+                             TRUE ~ '')) %>%
+    mutate(Rank = rank(-Diff)) %>% #Rank indicates if it is positive or negative selection while Abs_rank is independent of direction
+    mutate(Label = case_when(Rank <= top/2 ~ Gene,
+                             Rank >= nrow(data)-top/2 ~ Gene,
+                             TRUE ~ '')) %>% 
+    arrange(Rank)
+  
+  diff_betas_cc <<- data
+  
+    threshold_pos_y <- data$Diff[data$Rank==100]
+    threshold_neg_y <- data$Diff[data$Rank == nrow(data)-100]
+    
+  
+  differential_hits <- ggplot(data, aes(!!ctrl, !!sample))+
+    geom_point(aes(col=Group), alpha=0.25)+
+    scale_colour_manual(values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3')
+, labels=c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential', 'Common Essential', 'Insubstantial Difference\nin Essentiality') )+
+    geom_hline(yintercept = 0, col='black', linetype='dotted', alpha = 0.35)+
+    geom_vline(xintercept = 0, col='black', linetype = 'dotted', alpha = 0.35)+
+    geom_abline(slope =1 , intercept =max(intercept), col='black', linetype='dashed', alpha = 0.35)+
+    geom_abline(slope= 1, intercept = min(intercept), col='black', linetype = 'dashed', alpha = 0.35)+
+    labs(x = 'Beta Scores of K27M-KO line',
+         y ='Beta Scores of K27M line',
+         title = str_wrap(paste('Comparison of beta indicates differential hits in the H3K27M line compared to H3K27M-KO line'),width = 65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')+
+    theme(legend.title=element_blank(),
+          legend.spacing.y=unit(0.25,'cm'))+
+    guides(colour = guide_legend(byrow = TRUE))+
+    geom_label_repel(aes(label=Label, col=Group), max.overlaps = 30, force =5, show.legend = FALSE)
+
+  print(differential_hits)
+  
+  rank_hits <- ggplot(data, aes(Rank, Diff))+
+    geom_point(aes(col=Group), alpha= 0.25)+
+     scale_colour_manual(values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3')
+, labels=c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential', 'Common Essential', 'Insubstantial Difference\nin Essentiality') )+
+    geom_hline(aes(linetype='dashed',yintercept = threshold_pos_y), col= 'black', alpha = 0.2)+
+    geom_hline(aes(linetype = 'dashed',yintercept = threshold_neg_y), col= 'black', alpha = 0.2) +
+    scale_linetype_manual(labels=c('Top 100 Hit Threshold'), values=c('dashed'))+
+    theme(legend.title=element_blank(),
+          legend.spacing.y=unit(0.25,'cm'))+
+    guides(colour = guide_legend(byrow = TRUE))+
+    geom_text_repel(aes(label=Label, col=Group), max.overlaps=30, force =5, force_pull=0.5, show.legend = FALSE)+
+    labs(x = 'Rank',
+         y = 'Difference in Beta Score',
+         title = str_wrap(paste('MAGeCK rank plot indicates top differential hits in the H3K27M line compared to H3K27M-KO line'),width = 65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')
+  
+  print(rank_hits)
+  
+  #Exporting .tsv files
+  write_tsv(diff_betas_cc,paste(prefix,'ranked_beta_list.tsv',sep='_'))
+  
+  pos_selection_hundred <- diff_betas_cc %>%
+    filter(Rank <= 100) %>%
+    arrange(Rank) %>%
+    select(Gene)
+  
+  write_tsv(pos_selection_hundred,paste(prefix,'ranked_beta_pos_100_list.tsv',sep='_'),col_names = FALSE)
+  
+  neg_selection_hundred <- diff_betas_cc %>%
+    filter(Rank >= nrow(diff_betas_cc)-100) %>%
+    arrange(-Rank)%>%
+    select(Gene)
+  
+  write_tsv(neg_selection_hundred,paste(prefix,'ranked_beta_neg_100_list.tsv',sep='_'),col_names = FALSE)
+  
+  #For non-common essential only in top 100
+    ce_filtered_pos_selection_hundred <- diff_betas_cc %>%
+    filter(Rank <= 100) %>%
+    filter(common_essential==FALSE) %>%
+    arrange(Rank) %>%
+    select(Gene)
+  
+  write_tsv(ce_filtered_pos_selection_hundred,paste(prefix,'ranked_beta_pos_100_ce_filtered_list.tsv',sep='_'),col_names = FALSE)
+  
+  ce_filtered_neg_selection_hundred <- diff_betas_cc %>%
+    filter(Rank >= nrow(diff_betas_cc)-100) %>%
+    filter(common_essential ==FALSE) %>%
+    arrange(-Rank)%>%
+    select(Gene)
+  
+  write_tsv(ce_filtered_neg_selection_hundred,paste(prefix,'ranked_beta_neg_100_ce_filtered_list.tsv',sep='_'),col_names = FALSE)
+  
+
+  return(list(differential_hits,rank_hits))
+}
+
+
+# differential_hits_plot <- differential_hits_plotter(mle_betas_cc, 'KO','CON', top = 10, sd_cutoff=2, prefix='DIPG') #For DIPG case, the CON H3K27M mutant is the cell line of interest on y-axis compared to the KO H3-KO mutant on x-axis
+# 
+# multiple_plot_exporter(differential_hits_plot, 'hit_plots')
+# 
+# rm(differential_hits_plot)
+
+```
+
+Below is the now-used variant of the above code but which implements the fdr significance cutoff instead of a quantile matching approach.
+
+```{r diff_hits_fdr}
+fdr_differential_hits_plotter <- function(data, x,y, top, fdr_cutoff, prefix){
+  
+  sample <- sym(y)
+  ctrl  <- sym(x)
+  slope <- 1
+  
+  
+  data$common_essential[data$Gene == 'TWISTNB'] <- TRUE
+  
+  data <- data %>%
+    mutate(Rank = rank(-Diff)) %>%
+    mutate(rank_Label = case_when(Rank <= top ~ Gene,
+                             Rank >= nrow(data)-top ~ Gene,
+                             TRUE ~ '')) %>% 
+    arrange(Rank)
+  
+  diff_betas_cc <<- data
+    
+  differential_hits <- ggplot(data, aes(!!ctrl, !!sample))+
+    geom_point(aes(col=Group), alpha=0.25)+
+    scale_colour_manual(values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3')
+, labels=c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential', 'Common Essential', 'Insignificant Difference\nin Essentiality') )+
+    geom_hline(yintercept = 0, col='black', linetype='dotted', alpha = 0.35)+
+    geom_vline(xintercept = 0, col='black', linetype = 'dotted', alpha = 0.35)+
+    geom_abline(aes(slope =1, intercept=0, linetype='dashed'), col='black', alpha=0.35)+
+    scale_linetype_manual(labels=c('Equivalence of Beta\nin K27M and K27M-KO'), values=c('dashed'))+
+    # geom_abline(slope =1 , intercept =max(intercept), col='black', linetype='dashed', alpha = 0.35)+
+    # geom_abline(slope= 1, intercept = min(intercept), col='black', linetype = 'dashed', alpha = 0.35)+
+    labs(x = 'Beta Scores of K27M-KO line',
+         y ='Beta Scores of K27M line',
+         title = str_wrap(paste('Comparison of beta indicates differential hits in the H3K27M line compared to H3K27M-KO line'),width = 65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')+
+    theme(legend.title=element_blank(),
+          legend.spacing.y=unit(0.25,'cm'))+
+    guides(colour = guide_legend(byrow = TRUE))+
+    geom_label_repel(aes(label=Label, col=Group), max.overlaps = 100000, force =1,force_pull=0.5, show.legend = FALSE, max.time=5)+
+    scale_y_continuous(expand=expansion(add=1))
+
+  print(differential_hits)
+  
+  threshold_pos_y <- data$Diff[data$Rank==100]
+  threshold_neg_y <- data$Diff[data$Rank == nrow(data)-100]
+  
+  rank_hits <- ggplot(data, aes(Rank, Diff))+
+    geom_point(aes(col=Group), alpha= 0.25)+
+    geom_hline(aes(linetype='dashed',yintercept = threshold_pos_y), col= 'black', alpha = 0.2)+
+    geom_hline(aes(linetype = 'dashed',yintercept = threshold_neg_y), col= 'black', alpha = 0.2) +
+    scale_linetype_manual(labels=c('Top 100 Hit Threshold'), values=c('dashed'))+
+    scale_colour_manual(values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3')
+, labels=c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential', 'Common Essential', 'Insignificant Difference\nin Essentiality') )+
+    theme(legend.title=element_blank(),
+          legend.spacing.y=unit(0.25,'cm'))+
+    guides(colour = guide_legend(byrow = TRUE))+
+    geom_text_repel(aes(label=rank_Label, col=Group), max.overlaps = 100000, force =1,force_pull=0.5, show.legend = FALSE, max.time=5)+
+    labs(x = 'Rank',
+         y = 'Difference in Beta Score',
+         title = str_wrap(paste('MAGeCK rank plot indicates top differential hits in the H3K27M line compared to H3K27M-KO line'),width = 65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')
+  
+  print(rank_hits)
+  
+  #Exporting .tsv files
+  write_tsv(data,paste(prefix,'ranked_beta_list.tsv',sep='_'))
+  
+  pos_selection_hundred <- data %>%
+    filter(Group == 'Less Essential') %>%
+    arrange(Rank) %>%
+    select(Gene)
+  
+  write_tsv(pos_selection_hundred,paste(prefix,'ranked_beta_pos_signif_list.tsv',sep='_'),col_names = FALSE)
+  
+  neg_selection_hundred <- data %>%
+    filter(Group == 'More Essential') %>%
+    arrange(-Rank)%>%
+    select(Gene)
+  
+  write_tsv(neg_selection_hundred,paste(prefix,'ranked_beta_neg_signif_list.tsv',sep='_'),col_names = FALSE)
+  
+  #For non-common essential 
+    ce_filtered_pos_selection_hundred <- data %>%
+    filter(Group == 'Less Essential') %>%
+    filter(common_essential==FALSE) %>%
+    arrange(Rank) %>%
+    select(Gene)
+  
+  write_tsv(ce_filtered_pos_selection_hundred,paste(prefix,'ranked_beta_pos_signif_ce_filtered_list.tsv',sep='_'),col_names = FALSE)
+  
+  ce_filtered_neg_selection_hundred <- data %>%
+    filter(Group == 'More Essential') %>%
+    filter(common_essential ==FALSE) %>%
+    arrange(-Rank)%>%
+    select(Gene)
+  
+  write_tsv(ce_filtered_neg_selection_hundred,paste(prefix,'ranked_beta_neg_signif_ce_filtered_list.tsv',sep='_'),col_names = FALSE)
+  
+
+  return(list(differential_hits,rank_hits))
+}
+
+
+fdr_diff_hits_plot <- fdr_differential_hits_plotter(wald_diff_output_tb, 'KO','CON', top = 6, prefix='DIPG') #For DIPG case, the CON H3K27M mutant is the cell line of interest on y-axis compared to the KO H3-KO mutant on x-axis
+
+multiple_plot_exporter(fdr_diff_hits_plot, 'fdr_hit_plots')
+
+rm(fdr_diff_hits_plot)
+```
+
+### Individual Gene Boxplots
+
+This section is to plot individual boxplots for normalised read counts over time for a series of genes to provide one summary figure of results including:
+- Normalised read counts of nontargeting controls over time (combining replicates into single box)
+- Normalised read counts of Depmap common essential over time (combining replicates into single box)
+- Normalised read counts of ASCL1 over time (combining replicates into single box)
+- Normalised read counts of BAMBI over time (combining replicates into single box)
+
+```{r individual_gene_boxplots_QC}
+
+#This plots individual boxplots of genes you specify in the function argument
+individual_gene_boxplotter <- function(input_norm_counts, subset_gene_name, gene_selection='', sample_selection=''){
+  
+  if (subset_gene_name == 'NTC'){
+    data_tb <- input_norm_counts %>%
+      filter(is.na(Gene))
+    main <- 'Normalised read counts of non-targeting controls are similar across timepoints'
+    wilcox_side <- 'two.sided'
+  } else if (subset_gene_name == 'CE'){
+    data_tb <- input_norm_counts %>%
+      filter(Gene %in% common_essentials$gene)
+    main <- 'Normalised read counts of DepMap common essential genes decrease significantly over time'
+    wilcox_side <- 'greater'
+  } else {
+    data_tb <- input_norm_counts %>%
+      filter(Gene == subset_gene_name)
+    
+    indiv_gene <- TRUE
+    
+    main <- paste('Normalised read counts of', subset_gene_name, 'indicate', gene_selection,'over time in',sample_selection)
+      if (str_detect(gene_selection,'essential')){
+        wilcox_side <- 'greater'
+      } else if (str_detect(gene_selection,'tsg')){
+        wilcox_side <- 'less'
+      }
+  }
+  
+  #Merging replicates together
+  data_tb <- data_tb %>%
+    mutate(Plasmid2 = Plasmid) %>%
+    rename(Plasmid1 = Plasmid) %>%
+    reshape2::melt() %>%
+    rename(sample=variable, count=value) %>%
+    mutate(Replicate = case_when(str_detect(sample,'r1|Plasmid')~'1', str_detect(sample, 'r2')~'2')) %>%
+    mutate(sample = case_when(
+      str_detect(sample,'CON_r1_d0')~'CON_d0',
+      str_detect(sample,'CON_r1_d11')~'CON_d11',
+      str_detect(sample,'CON_r1_d21')~'CON_d21',
+      str_detect(sample,'CON_r2_d0')~'CON_d0',
+      str_detect(sample,'CON_r2_d11')~'CON_d11',
+      str_detect(sample,'CON_r2_d21')~'CON_d21',
+      str_detect(sample,'KO_r1_d0')~'KO_d0',
+      str_detect(sample,'KO_r1_d11')~'KO_d11',
+      str_detect(sample,'KO_r1_d21')~'KO_d21',
+      str_detect(sample,'KO_r2_d0')~'KO_d0',
+      str_detect(sample,'KO_r2_d11')~'KO_d11',
+      str_detect(sample,'KO_r2_d21')~'KO_d21',
+      str_detect(sample,'Plasmid1') ~ 'Plasmid1',
+      str_detect(sample,'Plasmid2') ~ 'Plasmid2'
+    )) %>%
+    mutate(sample = factor(sample, levels = c('Plasmid1','CON_d0','CON_d11','CON_d21','Plasmid2','KO_d0','KO_d11','KO_d21'),ordered=TRUE)) %>%
+    mutate(CellLine = case_when(str_detect(sample,'CON')~'K27M', str_detect(sample,'KO')~'K27M-KO', str_detect(sample,'Plasmid')~'Plasmid')) %>%
+    mutate(Timepoint = case_when(str_detect(sample,'d0') ~ 'Day 0',
+                                 str_detect(sample,'d11') ~ 'Day 11',
+                                 str_detect(sample,'d21') ~ 'Day 21',
+                                 str_detect(sample,'Plasmid') ~ 'Plasmid',)) 
+  
+  top_comparisons <- list(c('CON_d0','CON_d21'),c('KO_d0','KO_d21'))
+  bot_comparisons <- list(c('CON_d0','CON_d11'),c('CON_d11','CON_d21'),
+                          c('KO_d0','KO_d11'),c('KO_d11','KO_d21'))
+  
+  indiv_tb <<- data_tb
+    #Code to include the individual gRNAs as separately coloured dots in geom_boxplot
+    if (indiv_gene == TRUE){
+      data_tb <- data_tb %>%
+        arrange(sgRNA) %>%
+        mutate(sgRNA_num = case_when(sgRNA == sgRNA[[1]] ~ '1',
+                                     sgRNA == sgRNA[[nrow(data_tb)]] ~ '2',
+                                     TRUE ~ '0'))
+    }
+  
+    read_distribution <- ggplot(data_tb, aes(x=sample, y=count)) +
+    geom_boxplot(aes(fill=CellLine), alpha=0.75) +
+    geom_point(aes(col=sgRNA_num), alpha=1)+
+    geom_signif(comparisons=top_comparisons
+                  ,test=(wilcox.test),test.args =c(alternative=wilcox_side), map_signif_level = TRUE, margin_top = 0.2)+
+    geom_signif(comparisons=bot_comparisons
+                  ,test=(wilcox.test),test.args =c(alternative=wilcox_side), map_signif_level = TRUE)+
+    scale_fill_brewer(name='',type='qual',palette='Set2')+
+    scale_colour_manual(name='gRNA', labels=c('1','2'), values=c('#ffd92f','#b3b3b3'))+
+    labs(x='Timepoint', y='Counts per gRNA', 
+       title=str_wrap(main, width =65),
+       caption='Statistical test via one-sided Wilcoxon Rank Sum Test')+
+    theme(axis.title.x=element_text(vjust=-0.5),
+          text=element_text(size=16))+
+    scale_x_discrete(labels=c('Plasmid','Day\n0','Day\n11', 'Day\n21',
+                              'Plasmid','Day\n0','Day\n11', 'Day\n21'))
+    
+    #if(gene_selection != ''){
+    #  read_distribution <- read_distribution +
+    #    geom_point(aes(x=sample, y= count,col=Replicate),data = data_tb) +
+    #    scale_colour_manual(labels=c('1','2'), values=c('#e5c494','#b3b3b3'))
+    #  read_distribution$layers <- c(geom_point(),read_distribution$layers[[1]],read_distribution$layers[[2]],read_distribution$layers[[3]],read_distribution$layers[[4]])
+    #}
+    
+    print(read_distribution)
+    return(read_distribution)
+    
+}
+
+#LMAO, YOU COULD TOTALLY DO ALL THESE WITH A SIMPLE MAP() FUNCTION
+
+#ntc_summary <- individual_gene_boxplotter(norm_counts,'NTC')
+#depmap_summary <- individual_gene_boxplotter(norm_counts,'CE')
+PCGF2_summary <- individual_gene_boxplotter(norm_counts,'PCGF2', 'essential','only the K27M line')
+ASCL1_summary <- individual_gene_boxplotter(norm_counts,'ASCL1','essential', 'only the K27M line')
+#TCF3_summary <- individual_gene_boxplotter(norm_counts,'TCF3','essential', 'only the K27M line')
+BAMBI_summary <- individual_gene_boxplotter(norm_counts,'BAMBI','essential', 'only the K27M line')
+AHR_summary <- individual_gene_boxplotter(norm_counts,'AHR','essential', 'only the K27M line')
+ARNT_summary <- individual_gene_boxplotter(norm_counts,'ARNT','essential', 'only the K27M line')
+
+#Some tumour suppressor genes
+PTEN_summary <-individual_gene_boxplotter(norm_counts,'PTEN','tsg', 'only the K27M line')
+CREBBP_summary <-individual_gene_boxplotter(norm_counts,'CREBBP','tsg', 'only the K27M line')
+TP53_summary <-individual_gene_boxplotter(norm_counts,'TP53','tsg', 'only the K27M line')
+#ARID2_summary <- individual_gene_boxplotter(norm_counts,'ARID2','essential', 'only the K27M line')
+#TPK1_summary <- individual_gene_boxplotter(norm_counts, 'TPK1','essential')
+#MAP2K7_summary <- individual_gene_boxplotter(norm_counts, 'MAP2K7','positive selection')
+#TNFAIP6_summary <- individual_gene_boxplotter(norm_counts, 'TNFAIP6','positive selection')
+#KDSR_summary <- individual_gene_boxplotter(norm_counts, 'KDSR','positive selection')
+#HES5_summary <- individual_gene_boxplotter(norm_counts,'HES5','essential')
+
+CDKN2A_summary <-individual_gene_boxplotter(norm_counts,'CDKN2A','essential', 'only the K27M line')
+
+#Some previously-IDed DIPG-specific vulnerabilities
+#BMI1_summary <-individual_gene_boxplotter(norm_counts,'BMI1','essential', 'only the K27M line')
+AFF4_summary <-individual_gene_boxplotter(norm_counts,'AFF4','essential', 'only the K27M line')
+BRD2_summary <-individual_gene_boxplotter(norm_counts,'BRD2','essential', 'only the K27M line')
+BRD4_summary <-individual_gene_boxplotter(norm_counts,'BRD4','essential', 'only the K27M line') # COMMON ESSENTIAL
+#HDAC1_summary <-individual_gene_boxplotter(norm_counts,'HDAC1','essential', 'only the K27M line')
+HDAC2_summary <-individual_gene_boxplotter(norm_counts,'HDAC2','essential', 'only the K27M line')
+#KDM6A_summary <-individual_gene_boxplotter(norm_counts,'KDM6A','essential', 'only the K27M line')
+#KDM6B_summary <-individual_gene_boxplotter(norm_counts,'KDM6B','essential', 'only the K27M line')
+#EZH2_summary <-individual_gene_boxplotter(norm_counts,'EZH2','essential', 'only the K27M line')
+EED_summary <-individual_gene_boxplotter(norm_counts,'EED','essential', 'only the K27M line')
+#SUZ12_summary <-individual_gene_boxplotter(norm_counts,'SUZ12','essential', 'only the K27M line')
+#RING1_summary <-individual_gene_boxplotter(norm_counts,'RING1','essential', 'only the K27M line')
+#RNF2_summary <-individual_gene_boxplotter(norm_counts,'RNF2','essential', 'only the K27M line')
+MYC_summary <-individual_gene_boxplotter(norm_counts,'MYC','essential', 'only the K27M line') #cOMMON ESSENTIAL
+#SMYD2_summary <-individual_gene_boxplotter(norm_counts,'SMYD2','essential', 'only the K27M line')
+NAMPT_summary <-individual_gene_boxplotter(norm_counts,'NAMPT','essential', 'only the K27M line')
+#NSD1_summary <-individual_gene_boxplotter(norm_counts,'NSD1','essential', 'only the K27M line')
+#NSD2_summary <-individual_gene_boxplotter(norm_counts,'NSD2','essential', 'only the K27M line')
+
+## These genes are the enriched ones from GO
+POLE3_summary <-individual_gene_boxplotter(norm_counts,'POLE3','essential', 'only the K27M line')
+POLE4_summary <-individual_gene_boxplotter(norm_counts,'POLE4','essential', 'only the K27M line')
+EIF3L_summary <-individual_gene_boxplotter(norm_counts,'EIF3L','essential', 'only the K27M line')
+EIF3K_summary <-individual_gene_boxplotter(norm_counts,'EIF3K','essential', 'only the K27M line')
+
+
+## These genes are significant K27M-specific essentials in only one of the two analysis pathways
+#MAGeCK-only
+MYH9_summary <-individual_gene_boxplotter(norm_counts,'MYH9','essential', 'only the K27M line')
+CYP27B1_summary<-individual_gene_boxplotter(norm_counts,'CYP27B1','essential', 'only the K27M line')
+METTL7B_summary <-individual_gene_boxplotter(norm_counts,'METTL7B','essential', 'only the K27M line')
+#BAGEL2-only
+ARID2_summary <-individual_gene_boxplotter(norm_counts,'ARID2','essential', 'only the K27M line')
+NPIPB9_summary <- individual_gene_boxplotter(norm_counts,'NPIPB9','essential', 'only the K27M line')
+RIPK3_summary<- individual_gene_boxplotter(norm_counts,'RIPK3','essential', 'only the K27M line')
+
+individual_boxplots <- list(ASCL1_summary, BAMBI_summary, AHR_summary, ARNT_summary, PCGF2_summary)
+multiple_plot_exporter(individual_boxplots, 'summary_read_boxplots')
+rm(individual_boxplots, ntc_summary, depmap_summary,ASCL1_summary, BAMBI_summary, AHR_summary, ARNT_summary, PCGF2_summary)
+
+previous_validated_boxplots <- list(AFF4_summary, BRD2_summary,HDAC2_summary, EED_summary)
+multiple_plot_exporter(previous_validated_boxplots, 'previous_validated_boxplots')
+
+
+```
+
+
+
+## Functional Analysis of Hits
+
+N.B This is deprecated + I decided to use ShinyGO instead!
+
+The MAGeCKFlute R package enables use of numerous functional analysis modules e.g Gene Ontology (GO) term analysis and Kyoto Encyclopedia of Genes & Genomes (KEGG) enrichment analysis.
+
+Specifically, gene enrichment analysis is applied via the EnrichAB() function sourced from FluteMLE() function. This enables enrichment of genes into 'clusters' defined by various databases including:
+1. KEGG (Kyoto Encylopedia of Genes & Genomes)
+2. GOBP (Gene Ontology Biological Processes)
+3. REACTOME (Reactome Biological Pathways)
+4. COMPLEX (CORUM Database of Protein Complexes)
+
+The genes identified as putative cell-line specific hits for positive and negative selection are arbitrarily defined via a beta-score cutoff of 2x standard deviations from the line y=x (as per the comparative plot earlier). These genes are enriched using the aforementioned databses into pathways/ontology via the following possible tests which can be defined in the EnrichAB function arguments:
+
+1. ORT (Over-representation test which tests if genes from pre-defined clusters from databases are over-represented in a subset of the data e.g in database, representation of genes in nucleotide-excision repair = 2%, ORT tests if there is overrpresetation of NER-linked genes in the positive or negative selection putative hits)
+2. GSEA (Gene Set Enrichment Analysis)
+3. HGT (Hypergeometric Test)
+
+```{r functional_analysis, warning=FALSE, message=FALSE}
+# scale_cutoff <- 2 #Default value for scale_cutoff in FluteMLE is 2x standard deviations for cutoff
+# intercept = c(-CutoffCalling(diff_betas_cc$Diff, scale_cutoff),
+#                   CutoffCalling(diff_betas_cc$Diff, scale_cutoff))
+# 
+# #Making EntrezID column name
+# diff_betas_cc$EntrezID = TransGeneID(diff_betas_cc$Gene, 'Symbol', "Entrez", organism = 'hsa')
+# 
+# input_enrich_df <- ScatterView(diff_betas_cc, "CON", "KO", groups = c("top", "bottom"),
+# 	                   groupnames = c("GroupA", "GroupB"), intercept = intercept)
+# 
+# 
+# source('./EnrichAB.R') #Sourcing source code function of EnrichAB.R and noenrichplot() from EnrichedView.R from MAGeCKFlute package
+# 
+# enrichment_results <- EnrichAB(input_enrich_df$data,
+#                                pvalue = 0.05, #For the pvalue cutoff for the statistical test used for enrichment
+#                                enrich_method = 'ORT',
+#                                limit = c(1,120), # Default values for min and max size of pathways
+#                                filename = 'dipg')
+
+
+enrichment_plotter <- function(enrich_data, database='KEGG', prefix){
+  
+  pos_name <- paste(tolower(database),'A',sep='')
+  neg_name <- paste(tolower(database),'B',sep='')
+  
+   if (database != 'COMPLEX'){
+    pos_title <- paste(database,'enrichment analysis shows clustering of positive selection hits into enriched pathways')
+    neg_title <- paste(database,'enrichment analysis shows clustering of negative selection hits into complexes')
+    
+  } else if (database == 'COMPLEX'){
+    pos_title <- paste(database,'enrichment analysis shows clustering of positive selection hits into enriched pathways')
+    neg_title <- paste(database,'enrichment analysis shows clustering of negative selection hits into complexes')
+  }
+  
+  #Convert positive and negative selection results to a tibble for ggplot
+  if(!is.null(enrich_data[[pos_name]]$enrichRes)){
+     pos_data <- as_tibble(enrich_data[[pos_name]]$enrichRes) %>%
+    mutate(neglogpval = -log10(`p.adjust`))
+     
+    pos_plot <- ggplot(pos_data, aes(x=neglogpval, y=Description))+
+    geom_point(aes(size=Count), col='blue')+
+    xlab('-log10 (adjusted p value)')+
+    labs(title=str_wrap(pos_title,width=60))+
+    theme(axis.title.y=element_blank())
+  
+    print(pos_plot)
+
+  } else{
+    print('No positive selection hits')
+  }
+  
+  if(!is.null(enrich_data[[neg_name]]$enrichRes)){
+    neg_data <- as_tibble(enrich_data[[neg_name]]$enrichRes)%>%
+    mutate(neglogpval = -log10(`p.adjust`))
+    
+    neg_plot <- ggplot(neg_data, aes(x=neglogpval, y=Description))+
+    geom_point(aes(size=Count), col='blue')+
+    xlab('-log10 (adjusted p value)')+
+    labs(title=str_wrap(neg_title,width=60))+
+    theme(axis.title.y=element_blank())
+  
+    print(neg_plot)
+  } else{
+    print('No negative selection hits')
+  }
+ 
+  
+  plot_list <- list(neg_plot, pos_plot)
+  multiple_plot_exporter(plot_list, paste(prefix,database,'enrichment_plots',sep='_'))
+  
+}
+
+# enrichment_plotter(enrichment_results, 'KEGG', 'dipg')
+# enrichment_plotter(enrichment_results, 'GOBP', 'dipg')
+# enrichment_plotter(enrichment_results, 'REACTOME', 'dipg')
+# enrichment_plotter(enrichment_results, 'COMPLEX', 'dipg')
+
+```
+
+
+### Plotter for ShinyGO Data
+This is a short code to plot my personal ShinyGO data - not generalisable.
+
+```{r shinygo_plotter}
+k27m_gocc <- read_csv(paste(working_directory, 'GOCC_K27M.csv', sep="/"))
+
+k27m_lollipop <- ggplot(k27m_gocc,aes(x=log10(`Fold Enrichment`), y=reorder(str_wrap(Pathway,width=25), -`Enrichment FDR`)))+
+  geom_point(aes(col=`Enrichment FDR`))+
+  geom_segment(aes(x=0, xend=log10(`Fold Enrichment`), y=str_wrap(Pathway,width=25), yend=str_wrap(Pathway,width=25), col=`Enrichment FDR`))+
+  xlab(bquote(log[10]~'(Fold Enrichment)'))+
+  ylab('Cellular Component')+
+  scale_colour_distiller(palette='RdBu')+
+  geom_label_repel(aes(label=Genes, col=`Enrichment FDR`))+
+  theme(text=element_text(size=16))
+
+print(k27m_lollipop)
+ggsave('k27m_lollipop_gocc.png',k27m_lollipop, width = 9, height = 6, units='in')
+
+
+ko_gocc <- read_csv(paste(working_directory, 'GOCC_K27M-KO.csv', sep="/")) %>%
+  mutate(ID = row_number()) %>%
+  filter(ID %in% c(1,3))
+
+ko_lollipop <- ggplot(ko_gocc,aes(x=log10(`Fold Enrichment`), y=reorder(str_wrap(Pathway,width=25), -`Enrichment FDR`)))+
+  geom_point(aes(col=`Enrichment FDR`))+
+  geom_segment(aes(x=0, xend=log10(`Fold Enrichment`), y=str_wrap(Pathway,width=25), yend=str_wrap(Pathway,width=25), col=`Enrichment FDR`))+
+  xlab(bquote(log[10]~'(Fold Enrichment)'))+
+  ylab('Cellular Component')+
+  scale_colour_distiller(palette='RdBu')+
+  geom_label_repel(aes(label=Genes, col=`Enrichment FDR`))+
+  theme(text=element_text(size=16))
+
+print(ko_lollipop)
+ggsave('k27m-ko_lollipop_gocc.png',ko_lollipop, width = 9, height = 6, units='in')
+```
+
+```{r terminus}
+sessionInfo()
+```
+

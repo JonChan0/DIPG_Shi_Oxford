@@ -1,0 +1,5 @@
+"Enrichment FDR","nGenes","Pathway Genes","Fold Enrichment","Pathway","URL","Genes"
+0.00915931973717593,2,5,165.789090909091,"Epsilon DNA polymerase complex "," http://amigo.geneontology.org/amigo/term/GO:0008622"," POLE4  POLE3"
+0.0283384431187471,2,16,51.8090909090909,"Eukaryotic 48S preinitiation complex "," http://amigo.geneontology.org/amigo/term/GO:0033290"," EIF3L  EIF3K"
+0.0283384431187471,2,18,46.0525252525252,"Eukaryotic translation initiation factor 3 complex "," http://amigo.geneontology.org/amigo/term/GO:0005852"," EIF3L  EIF3K"
+0.0283384431187471,2,19,43.6287081339713,"Translation preinitiation complex "," http://amigo.geneontology.org/amigo/term/GO:0070993"," EIF3L  EIF3K"

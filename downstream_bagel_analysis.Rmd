@@ -1,0 +1,498 @@
+---
+title: "Downstream BAGEL Analysis"
+author: "Jonathan Chan"
+
+date: '`r format(Sys.Date())`'
+output: 
+  html_document:
+    code_folding: hide
+bibliography:
+  - Bibliography.bib
+---
+
+# Downstream BAGEL Analysis for CRISPR Screen
+
+This provides the analysis of the output from BAGELv2 by @Kim2021 which provides a Bayesian classifier to classify genes into essential or non-essential classes using training datasets of known gold-standard essential and non-essential genes.
+
+These two gold-standard datasets are used to train a kernel density estimate (i.e estimated probability distribution) for the guide-level fold changes of the essential and non-essential genes respectively. This provides a model distribution of 'essential' genes and a model distribution of 'non-essential' genes. To calculate an output 'score' of essentiality, BAGELv2 uses a log(Bayes Factor) - a combined metric of statistical significance and effect size - which is calculated for each guide RNA.
+
+To prevent overfitting, a 10-fold cross validation approach is used to resample the dataset into training and test set where in each iteration of sampling, new fold change model distributions are calculated for the 'essential' and 'nonessential' genes via kernel density estimation using those genes included in the resample.
+
+Specifically, the guide-level log(BF) = log (likelihood of observing observed fold changes for particular gRNA given essential 'model' prob. distribution/likelihood of observing fold changes ... given nonessential 'model' prob. distribution). This is then calculated via a linear regression model of log (likelihood ratio).
+Replicate-level BF is them summed into a screen-level sgRNA BF and then the sum of the individual sgRNA BF for each gene is taken as the gene-level BF.
+
+N.B Bayes Factor itself is actually log2(BF)
+
+BAGELv2 also adds in a correction algorithm to factor out non-specific multi-targeting effects of CRISPR-cas9 to reduce the number of false positives. Further technical detail can be found in @Kim2021
+
+
+The particular overall pipeline, as outlined in @Kim2021 is as follows:
+1. Mapping reads to library (e.g via MAGeCK count)
+2. Normalisation of reads (via median-normalisation) and calculation of guide-level fold changes across timepoints
+3. Compilation of gene-level information to estimate the essentiality of each gene
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+#library(showtext)
+library(ggrepel)
+#library(ggVennDiagram)
+library(viridis)
+
+working_directory <- getwd()
+working_directory <- paste(working_directory,'bagel', sep='/') # Need to define your working directory folder here
+
+#Importing Futura BKBT Font
+#font_add(family = "futura_bkt", regular = "./Futura-Bk-BT-Book_18979.ttf")
+# turn on shoCONext
+#showtext_auto()
+
+theme_set(
+  theme_classic()
+  + theme(text = element_text(family = 'sans', size=14))
+  ) #Sets ggplot theme to classic
+
+multiple_plot_exporter <- function(input_plot_list, pdf_name){ #Function to export several ggplot objects into single pdf
+  
+  pdf(paste(pdf_name,'.pdf', sep=''), onefile=TRUE)
+  for (i in seq_along(input_plot_list)){
+    print(input_plot_list[[i]])
+  }
+  dev.off()
+}
+
+common_essentials <- read_csv(paste(working_directory,'library_data/CRISPR_common_essentials_depmap_feb22.csv',sep='/')) %>%
+  mutate(gene = str_extract(gene,'[^ (]*'))
+```
+
+## Import of Bayes Factor Data
+
+This imports the data from the Bayes factor files outputted from BAGELv2 and appends a column indicating if the gene is included in DepMap Common Essential Genes.
+
+```{r bayes_factor_import, include=FALSE}
+#! You need to define your own Bayes factor output here
+bf_con_endp <- read_delim(paste(working_directory,'output_bayes_factors','bf_con_endpoint.txt',sep='/')) %>%
+  mutate(common_essential = case_when(GENE %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+bf_ko_endp <- read_delim(paste(working_directory,'output_bayes_factors','bf_ko_endpoint.txt',sep='/'))%>%
+  mutate(common_essential = case_when(GENE %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+bf_con_midp <- read_delim(paste(working_directory,'output_bayes_factors','bf_con_midpoint.txt',sep='/'))%>%
+  mutate(common_essential = case_when(GENE %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+bf_ko_midp <- read_delim(paste(working_directory,'output_bayes_factors','bf_ko_midpoint.txt',sep='/'))%>%
+  mutate(common_essential = case_when(GENE %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+
+```
+
+
+# Comparison Plots of Bayes Factor Data
+
+This provides the following comparison plots of Bayes factors for all genes, with common essential genes coloured in green.
+
+It uses a scaled version of the Bayes Factor interpretation table from Lee & Wagenmakers (2014) to classify the relative essentiality of genes - see Appendix of dissertation for the exact table.
+You need to modify this table yourself:
+1. Google Bayes Factor Interpretation table online
+2. Convert the Bayes Factor values to log2() because BAGEL2 performs log2() on all its Bayes Factors
+3. Multiply the value by the scaling factor used from median-normalisation with positive control genes in MAGeCKFlute to get a interpretation table for each condition
+
+See Dissertation Appendix for an example.
+
+
+```{r comparison_plot_Bayes}
+
+source('./ScatterView.R')
+
+#Defining function from MAGeCKFLute to median-normalised based on values of cell cycle genes
+normaliseBF <- function(BF, method='cell_cycle', samples){
+  
+  normalized <- BF[,colnames(BF)[setdiff(1:ncol(BF), 'HumanGene')]]
+  ids <- BF$HumanGene
+  normalized <- normalized[,samples]
+  normalized <- as.matrix(normalized)
+  
+  
+  Zuber_essential <- readRDS('Zuber_Essential.rds')
+  posControl <- Zuber_essential$GeneSymbol
+  
+  idx <- which(ids %in% toupper(posControl))
+  if(length(idx)>0){
+    med <- apply(normalized[idx,],2,median, na.rm=TRUE)
+    med <- abs(med-0.1) #Some correction factor for median normalisation
+    normalized <- t(t(normalized)/med)
+  }else {
+    warning('No positive control genes mapped!')
+  }
+  
+  BF[,samples] <- normalized
+  return(BF)
+}
+  
+# This plots the comparative plot of Bayes Factors for your two conditions
+comparison_Bayes_plotter <- function(input_bf1, input_bf2,samplename1, samplename2, top=6, prefix){
+  
+  name1 <- sym(samplename1)
+  name2 <- sym(samplename2)
+  
+  input_tb1 <- input_bf1 %>%
+    arrange(GENE) %>%
+    filter(GENE != 'NO_GENE_NAME')
+  
+  input_tb1$common_essential[input_tb1$GENE == 'TWISTNB'] <- TRUE
+  input_tb1$common_essential[input_tb1$GENE == 'POLR2A'] <- TRUE
+  input_tb1$common_essential[input_tb1$GENE == 'RSL24D1'] <- TRUE
+  colnames(input_tb1)[2] <- samplename1
+  
+  input_tb2 <- input_bf2 %>%
+    arrange(GENE) %>%
+    filter(GENE != 'NO_GENE_NAME')
+  
+  input_tb2$common_essential[input_tb2$GENE == 'TWISTNB'] <- TRUE
+  input_tb1$common_essential[input_tb1$GENE == 'POLR2A'] <- TRUE
+  input_tb1$common_essential[input_tb1$GENE == 'RSL24D1'] <- TRUE
+  colnames(input_tb2)[2] <- samplename2
+  
+  input_plot_tb <- bind_cols(input_tb1, input_tb2[[2]])
+  colnames(input_plot_tb)[4] <- samplename2
+  
+  
+  
+  #Median normalisation based on cell cycle genes' BF
+  input_plot_tb$HumanGene = MAGeCKFlute::TransGeneID(input_plot_tb$GENE, fromType = "symbol", toType = "symbol")
+  non_normalised_BF <<- input_plot_tb
+  
+  input_plot_tb <- normaliseBF(input_plot_tb, samples=c(samplename1, samplename2), 
+                         method="cell_cycle")
+  
+  normalised_BF <<- input_plot_tb
+  
+  input_plot_tb <- input_plot_tb %>%
+    mutate(Diff = !!name2 - !!name1) %>%
+    mutate(Rank = rank(-Diff))
+        
+  #Defining cutoff values for 95% of distribution of differences; top 100 positive and negative  
+  #intercept = c(CutoffCalling(input_plot_tb$Diff,sd_cutoff),-CutoffCalling(input_plot_tb$Diff, sd_cutoff))
+  threshold_pos_y <- input_plot_tb$Diff[input_plot_tb$Rank==100]
+  threshold_neg_y <- input_plot_tb$Diff[input_plot_tb$Rank == nrow(input_plot_tb)-100]
+  
+  input_plot_tb <- input_plot_tb %>%
+    mutate(Group = case_when(K27M >= 0.08 & `K27M-KO` <= -0.206 & common_essential == FALSE ~ 'K27M-specific Essential',
+                             K27M <= -0.08 & `K27M-KO` >= 0.206 & common_essential == FALSE ~ 'K27M-KO-specific Essential',
+                             common_essential == TRUE ~ 'Common Essential',
+                             TRUE ~ 'None'),
+           Group = factor(Group, levels=c('K27M-specific Essential','K27M-KO-specific Essential', 'Common Essential', 'None'), ordered=TRUE),
+           Specific_Essential_Group = case_when(Group %in% c('K27M-specific Essential','K27M-KO-specific Essential') ~ 'Specific Essential',
+                                                TRUE ~ 'None'),
+           rank_Label = case_when(Rank <= top ~ GENE,
+                             Rank >= nrow(input_plot_tb)-top ~ GENE,
+                             TRUE ~ '')) %>%
+    group_by(Specific_Essential_Group) %>%
+    mutate(abs_diff_rank = rank(-abs(Diff))) %>%
+    ungroup() %>%
+  mutate(abs_diff_rank = case_when(Specific_Essential_Group == 'None'  ~ 10000, #Setting the rank for the not specific essential genes to 10000
+                                   TRUE ~ abs_diff_rank),
+           Label = case_when(abs_diff_rank <= top ~ GENE,
+                             TRUE ~ ''))
+
+  # annotations <- data.frame(
+  #       xpos = c(-Inf,-Inf,Inf,Inf),
+  #       ypos =  c(-Inf, Inf,-Inf,Inf),
+  #       annotateText = c("Non-Essential","K27M-specific\n Essential"
+  #                       ,"K27M-KO-specific Essential","Essential"),
+  #       hjustvar = c(-0.1,-0.1,1.1,1.1) ,
+  #       vjustvar = c(-0.25,1.25,-0.25,1.25),
+  #       text_col=c('#b3b3b3','#e78ac3','#ffd92f', '#a6d854'))
+  
+  bagel_output_tb <<- input_plot_tb #Output for downstream combined analysis with MAGeCK
+  
+  comparison_plot <- ggplot(input_plot_tb, aes(!!name1, !!name2))+
+    geom_point(aes(col=Group),alpha=0.25)+
+    xlab(paste('Bayes Factors of',samplename1,'line'))+
+    ylab(paste('Bayes Factors of',samplename2,'line'))+
+    labs(title=str_wrap(paste('Comparison of Bayes Factors of', samplename2,'line relative to', samplename1, 'line indicates condition-specific essential genes'),width=65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')+
+    scale_colour_manual(labels = c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential', 'Common Essential', 'Insignificant Difference\nin Essentiality'), values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3'))+
+  #  geom_vline(xintercept=0, linetype='dotted', col='black', alpha = 0.35)+
+   # geom_hline(yintercept=0, linetype='dotted', col='black', alpha = 0.35)+
+    # Threshold lines for essentiality and non-essentiality moderate evidence
+    geom_vline(aes(xintercept = 0.206, linetype='dotted'),col='blue', alpha=0.35)+ #Threshold for K27M-KO BF
+    geom_vline(aes(xintercept = -0.206, linetype='dotted'),col='red', alpha=0.35)+
+    geom_hline(aes(yintercept=0.08, linetype='dashed'), col='blue', alpha = 0.35)+ #Threshold for K27M BF
+    geom_hline(aes(yintercept=-0.08, linetype='dashed'), col='red', alpha = 0.35)+
+    geom_abline(aes(slope =1, intercept=0, linetype='dashed'), col='black', alpha=0.35)+ #Equivalence line
+    scale_linetype_manual(name = "Threshold", values = c('dashed','dotted'), labels=c('K27M Thresholds','K27M-KO Thresholds'),
+                          guide = guide_legend(override.aes = list(color = c('red'))))+
+    geom_label_repel(aes(col=Group, label=Label), max.overlaps = 100000, force =1,force_pull=0.5, show.legend = FALSE, max.time=5)+
+    theme(legend.title=element_blank(),
+          legend.spacing.y=unit(0.25,'cm'))+
+    guides(colour = guide_legend(byrow = TRUE))
+    #Expand to fit in quadrant labels
+    #scale_x_continuous(expand=expansion(add=0.5))+
+    #scale_y_continuous(expand=expansion(add=0.5))+
+    #geom_text(data=annotations,aes(x=xpos,y=ypos,hjust=hjustvar,vjust=vjustvar,label=annotateText), show.legend=FALSE)
+    
+  print(comparison_plot)
+  
+  rank_hits <- ggplot(input_plot_tb, aes(Rank, Diff))+
+    geom_point(aes(col=Group), alpha= 0.25)+
+     scale_colour_manual(labels = c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential', 'Common Essential', 'Insubstantial Difference\nin Essentiality'), values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3'))+
+    geom_hline(aes(linetype='dashed',yintercept = threshold_pos_y), col= 'black', alpha = 0.2)+
+    geom_hline(aes(linetype = 'dashed',yintercept = threshold_neg_y), col= 'black', alpha = 0.2) +
+    scale_linetype_manual(labels=c('Top 100 Hit Threshold'), values=c('dashed'))+
+    theme(legend.title=element_blank(),
+          legend.spacing.y=unit(0.25,'cm'))+
+    guides(colour = guide_legend(byrow = TRUE))+
+    geom_text_repel(aes(label=rank_Label, col=Group), max.overlaps = 100000, force =1,force_pull=0.5, show.legend = FALSE, max.time=5)+
+    labs(x = 'Rank',
+         y = 'Difference in Bayes Factor',
+         title = str_wrap(paste('BAGEL rank plot indicates top hits for differences in essentiality in the H3K27M line compared to H3K27M-KO line'),width = 65),
+         caption= 'Common essential genes sourced from DepMap Q1/22')
+  
+  print(rank_hits)
+  
+  #Exporting .tsv files
+  write_tsv(input_plot_tb,paste(prefix,'ranked_bf_list.tsv',sep='_'))
+  
+  selection_hundred <- input_plot_tb %>%
+    filter(Group == 'K27M-KO-specific Essential') %>%
+    filter(common_essential ==FALSE) %>%
+    arrange(Rank) %>%
+    select(GENE, Diff)
+  
+  write_tsv(selection_hundred,paste(prefix,'ranked_bf_sig_pos__ce_filtered_list.tsv',sep='_'),col_names = FALSE)
+  
+    selection_hundred <- input_plot_tb %>%
+    filter(Group == 'K27M-specific Essential') %>%
+    filter(common_essential ==FALSE) %>%
+    arrange(Rank) %>%
+    select(GENE, Diff)
+  
+  write_tsv(selection_hundred,paste(prefix,'ranked_bf_sig_neg_ce_filtered_list.tsv',sep='_'),col_names = FALSE)
+
+  
+  
+  return(list(comparison_plot, rank_hits))
+}
+
+dipg_con_vs_ko <- comparison_Bayes_plotter(bf_ko_endp,bf_con_endp, 'K27M-KO', 'K27M', prefix='CON_vs_KO', top=6)
+#dipg_con_vs_ko_endpt_bf<- comparison_Bayes_plotter(bf_ko_endp, bf_con_endp, 'K27M-KO Endpoint', 'K27M Endpoint', prefix='CON_vs_KO_endpoint')
+#dipg_con_vs_ko_midpt_bf<- comparison_Bayes_plotter(bf_ko_midp, bf_con_midp, 'K27M-KO Midpoint','K27M Midpoint', prefix='CON_vs_KO_midpoint')
+#dipg_end_vs_mid_con_bf <- comparison_Bayes_plotter(bf_con_midp, bf_con_endp, 'K27M Midpoint','K27M Endpoint', prefix='CON_mid_vs_endpoint')
+#dipg_end_vs_mid_ko_bf <- comparison_Bayes_plotter(bf_ko_midp, bf_ko_endp, 'K27M-KO Midpoint','K27M-KO Endpoint', prefix='KO_mid_vs_endpoint')
+
+bf_comparative_plots <- list(dipg_con_vs_ko
+                             #, dipg_con_vs_ko_endpt_bf, dipg_con_vs_ko_midpt_bf, dipg_end_vs_mid_con_bf,dipg_end_vs_mid_ko_bf
+                             )
+multiple_plot_exporter(bf_comparative_plots, 'bf_comparative_plots')
+
+rm(bf_comparative_plots
+   #, dipg_con_vs_ko, dipg_con_vs_ko_endpt_bf, dipg_con_vs_ko_midpt_bf, dipg_end_vs_mid_con_bf, dipg_end_vs_mid_ko_bf
+   )
+
+
+
+```
+
+### Permutation Test
+
+Below code is deprecated!
+
+This statistical test is to test if there is a significant difference for each gene between its CON and KO scores.
+To do this when there is no statistical approximation that would be fully justified (e.g CLT -> normal approximation), you can use permutation (i.e randomly swapping all the Gene labels across all genes to compute difference between CON and KO scores) to generate a null distribution of difference in score.
+Then, you can use this null distribution to see where the observed difference for each gene lies and compute a p-value.
+
+The process is:
+1. Sample randomly from CON pool and sample randomly from KO pool -> compute difference in score
+2. Repeat n times -> null distribution of difference in score for CON vs. KO
+3. Calculate p-value for each gene using the same null distribution using two-sided test (i.e convert diffs to absolute values and calculate proportion of null distribution values > observed difference)
+- Also need to add 1 to both numerator and denominator to avoid misestimation as per Phipson & Smyth, 2010.
+
+```{r permutation_test}
+
+permutation_tester <- function(input_df,n_permutations){
+  
+  set.seed(0)
+  null_diff <- vector('numeric',n_permutations)
+  
+  for (i in seq(n_permutations)){
+    null_diff[i] <- sample(input_df$K27M,1)-sample(input_df$`K27M-KO`,1)
+  }
+  
+  null_diff_tb <- tibble(Diff = null_diff)
+  null_diff_pdf <- ggplot(null_diff_tb)+
+    geom_density(aes(x=Diff))+
+    xlab('Difference in Bayes Factor')+
+    ylab('Density')+
+    labs(title='Probability Density Function of Difference in Bayes Factor')+
+    geom_vline(xintercept = 0, linetype='dashed', col='red')
+  
+  print(null_diff_pdf)
+  
+  output_pvals <- input_df %>%
+    select(GENE,K27M, `K27M-KO`,common_essential) %>%
+    mutate(Diff = K27M- `K27M-KO`) %>%
+    arrange(GENE)
+  
+  pvals <- vector('numeric', length(input_df$GENE))
+  
+  for (i in seq_along(pvals)){
+    diff_value <- abs(output_pvals$Diff[[i]])
+    pvals[i] <- (sum(abs(null_diff)>diff_value)+1) / (length(null_diff)+1) #Calculates p-value of proportion of null distribution with greater absolute value of difference in score with correction as per Phipson & Smyth 2010.
+  }
+  
+  adjusted_pvals <- p.adjust(pvals, method='BH')
+  output_pvals <- cbind(output_pvals, pvals, adjusted_pvals)
+  
+  return(output_pvals)
+  
+}
+
+#permuted_diff_bf <- permutation_tester(normalised_BF, 100000)
+
+```
+
+# Comparative Plot of MAGeCK vs. BAGEL Analysis
+
+```{r mageck_vs_bagel}
+
+#This initialises the combo_tb to accumulate both your mageck and bagel results
+combo_comp_tb <- bagel_output_tb %>%
+  select(Gene=GENE,common_essential,BF_diff = Diff, BF_group = Group) %>%
+  arrange(Gene)
+
+#This imports the wald_diff_output_tb from downstream_mageck_analysis.Rmd which is outputted from that script into the current folder and modifies it slightly.
+wald_diff_output_tb <- read_tsv('./wald_diff_output.tsv')
+mageck_comp_tb <- wald_diff_output_tb %>% #From downstream_mageck_analysis.Rmd
+  select(Gene, Beta_diff = Diff, Beta_group = Group) %>%
+  filter(!is.na(Gene)) %>%
+  arrange(Gene)
+
+#This code adds the columns from the MAGeCK analysis to the combo_tb
+combo_comp_tb$Beta_diff <- mageck_comp_tb$Beta_diff
+combo_comp_tb$Beta_group <- mageck_comp_tb$Beta_group
+
+#This code creates a final combo_tb with labels and groups for ggplot2
+#It uses a classification approach labelling condition-specific essential genes based on if they are that label in BOTH mageck and bagel analyses. Otherwise, they become 'insubstantial difference in essentiality'
+combo_comp_tb <- combo_comp_tb %>%
+  mutate(Diff_diff = BF_diff - Beta_diff,
+         Group = case_when(Beta_group == 'K27M-specific Essential' & BF_group =='K27M-specific Essential' ~ 'K27M-specific Essential',
+                                 Beta_group == 'K27M-KO-specific Essential' & BF_group == 'K27M-KO-specific Essential' ~ 'K27M-KO-specific Essential',
+                                 common_essential == TRUE ~ 'Common Essential',
+                                 TRUE ~ 'None'),
+         Group = factor(Group, levels=c('K27M-specific Essential','K27M-KO-specific Essential', 'Common Essential', 'None'), ordered=TRUE),
+         Specific_Essential_Group = case_when(Group %in% c('K27M-specific Essential','K27M-KO-specific Essential') ~ 'Specific Essential',
+                                                TRUE ~ 'None'),
+         Rank = rank(-Diff_diff)) %>%
+         group_by(Specific_Essential_Group) %>%
+    mutate(abs_diff_rank = rank(-abs(Diff_diff))) %>%
+    ungroup() %>%
+  mutate(abs_diff_rank = case_when(Specific_Essential_Group == 'None'  ~ 10000, #Setting the rank for the not specific essential genes to 10000
+                                   TRUE ~ abs_diff_rank),
+           Label = case_when(abs_diff_rank <= 6 ~ Gene,
+                             TRUE ~ ''))
+
+threshold_pos_y <- combo_comp_tb$Diff_diff[combo_comp_tb$Rank==100]
+threshold_neg_y <- combo_comp_tb$Diff_diff[combo_comp_tb$Rank == nrow(combo_comp_tb)-100]
+
+#This code prints an Rsq value for the straight line of y=x which represents the same value for difference in Bayes Factor and difference in beta-score
+residuals <- combo_comp_tb$BF_diff - (-combo_comp_tb$Beta_diff)
+sum_sq_residuals <- sum(residuals^2)
+total_sum_sq <- sum((combo_comp_tb$BF_diff - mean(combo_comp_tb$BF_diff))^2)
+Rsq <- 1-(sum_sq_residuals/total_sum_sq)
+print(Rsq)
+
+#This code creates the comparative plot between MAGeCK and BAGEL2 analysis
+mageck_vs_bagel <- ggplot(combo_comp_tb, aes(Beta_diff,BF_diff)) +
+                  geom_point(aes(col=Group), alpha=0.4)+
+  scale_colour_manual(labels = c('K27M-specific Essential', 'K27M-KO-specific Essential', 'Common Essential', 'Insubstantial Difference\nin Essentiality'), values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3'))+
+  xlab('Difference in Beta Score (MAGeCK)')+
+  ylab('Difference in Bayes Factor (BAGEL)')+
+  labs(title=str_wrap('Comparison of hits from BAGEL vs. MAGeCK shows agreement and emphasises top synthetic lethal hits of ASCL1, AHR, ARNT and BAMBI',width=65))+
+  geom_label_repel(aes(label=Label, col=Group), force =5, force_pull=0.5, show.legend = FALSE)+
+  geom_abline(aes(slope =-1, intercept=0, linetype='dashed'), col='black', alpha=0.5)+
+  # geom_abline(aes(slope = 1, intercept = max(comp_intercept)), col='black', alpha= 0.5, linetype= 'dotted', show.legend=FALSE)+
+  # geom_abline(aes(slope = 1, intercept = min(comp_intercept)), col='black', alpha= 0.5, linetype= 'dotted', show.legend=FALSE)+
+  scale_linetype_manual(labels=c(str_wrap('Equivalence in BAGEL & MAGeCK Analysis',width=25)), values=c('dashed', 'dotted'))+
+  theme(legend.title=element_blank())
+
+print(mageck_vs_bagel)
+
+#This plots a rank plot but is deprecated
+# rank_hits_mageck_vs_bagel <- ggplot(combo_comp_tb, aes(Rank, Diff_diff))+
+#     geom_point(aes(col=Group), alpha= 0.25)+
+#      scale_colour_manual(labels = c('K27M-specific Essential', 'K27M-KO-specific Essential', 'Common Essential', 'Insignificant Difference\nin Essentiality'), values=c('#e78ac3','#ffd92f', '#a6d854','#b3b3b3'))+
+#     geom_hline(aes(linetype='dashed',yintercept = threshold_pos_y), col= 'black', alpha = 0.2)+
+#     geom_hline(aes(linetype = 'dashed',yintercept = threshold_neg_y), col= 'black', alpha = 0.2) +
+#     scale_linetype_manual(labels=c('Top 100 Hit Threshold'), values=c('dashed'))+
+#     theme(legend.title=element_blank())+
+#     geom_text_repel(aes(label=Label, col=Group), force =5, force_pull=0.5, show.legend = FALSE)+
+#     labs(x = 'Rank',
+#          y = 'Combined Relative Essentiality Score',
+#          title = str_wrap(paste('Combined rank plot indicates top hits for differences in essentiality in the H3K27M line compared to H3K27M-KO line'),width = 65),
+#          caption= 'Common essential genes sourced from DepMap Q1/22')
+#   
+#   print(rank_hits_mageck_vs_bagel)
+  
+multiple_plot_exporter(list(mageck_vs_bagel
+                            #, rank_hits_mageck_vs_bagel
+                            ),'mageck_vs_bagel_plot')
+
+#Exporting .tsv files
+prefix <- 'diff_diff'
+  write_tsv(combo_comp_tb,paste(prefix,'ranked_bf_list.tsv',sep='_'))
+  
+  selection_hundred <- combo_comp_tb %>%
+    filter(Group == 'K27M-specific Essential') %>%
+    arrange(Rank) %>%
+    select(Gene, Diff_diff)
+  
+  write_tsv(selection_hundred,paste(prefix,'ranked_bf_neg_sig_list.tsv',sep='_'),col_names = FALSE)
+
+  
+  #For non-common essential only in top 100
+  
+  ce_filtered_selection_hundred <- combo_comp_tb %>%
+    filter(Group == 'K27M-specific Essential') %>%
+    filter(common_essential ==FALSE) %>%
+    arrange(Rank)%>%
+    select(Gene)
+  
+  write_tsv(ce_filtered_selection_hundred,paste(prefix,'ranked_bf_neg_sig_ce_filtered_list.tsv',sep='_'),col_names = FALSE)
+
+
+```
+
+
+# Screen Performance via Precision-Recall Plots
+This code is deprecated and not in use!
+```{r bagel_pr}
+pr_con_endp <- read_delim(paste(working_directory,'output_pr','bf_con_endpoint.pr',sep='/')) %>%
+  mutate(common_essential = case_when(Gene %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+pr_ko_endp <- read_delim(paste(working_directory,'output_pr','bf_ko_endpoint.pr',sep='/'))%>%
+  mutate(common_essential = case_when(Gene %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+pr_con_midp <- read_delim(paste(working_directory,'output_pr','bf_con_midpoint.pr',sep='/'))%>%
+  mutate(common_essential = case_when(Gene %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+pr_ko_midp <- read_delim(paste(working_directory,'output_pr','bf_ko_midpoint.pr',sep='/'))%>%
+  mutate(common_essential = case_when(Gene %in% common_essentials$gene ~ TRUE, TRUE~FALSE))
+
+pr_plotter <- function(input_pr, prefix){
+  
+  pr_plot <- ggplot(input_pr,aes(Recall, Precision))+
+    geom_line()+
+    ylab('Precision (1-FDR)')+
+    xlab('Recall')+
+    labs(title=str_wrap(paste('Precision-recall plot for', prefix),width=65))+
+    scale_x_continuous(limits=c(0,1.1))+
+    scale_y_continuous(limits=c(0,1,1))
+  
+  print(pr_plot)
+}
+
+#pr_plotter(pr_con_endp, 'K27M Endpoint')
+
+# pr_samples <- list(pr_con_endp, pr_con_midp, pr_ko_endp, pr_ko_midp)
+# pr_prefixes <- c('K27M Endpoint','K27M Midpoint', 'K27M-KO Endpoint', 'K27M-KO Midpoint')
+# pr_plots <- map(pr_samples,pr_plotter)
+
+
+```
+

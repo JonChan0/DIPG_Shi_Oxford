@@ -1,0 +1,3 @@
+"Enrichment FDR","nGenes","Pathway Genes","Fold Enrichment","Pathway","URL","Genes"
+0.010236657855872,2,10,142.475,"Aryl hydrocarbon receptor complex "," http://amigo.geneontology.org/amigo/term/GO:0034751"," AHR  ARNT"
+0.0265011454838103,5,465,7.65994623655914,"Transcription regulator complex "," http://amigo.geneontology.org/amigo/term/GO:0005667"," AHR  ASCL1  ARNT  RCOR2  TCF4"

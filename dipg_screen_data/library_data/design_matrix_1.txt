@@ -1,0 +1,13 @@
+samples	baseline	CON3	KO2	d11	d21	rep1	rep2
+CON_r1_baseline	1	0	0	0	0	1	0
+CON_r1_midpoint	1	1	0	1	0	1	0
+CON_r1_endpoint	1	1	0	0	1	1	0
+CON_r2_baseline	1	0	0	0	0	0	1
+CON_r2_midpoint	1	1	0	1	0	0	1
+CON_r2_endpoint	1	1	0	0	1	0	1
+KO_r1_baseline	1	0	0	0	0	1	0
+KO_r1_midpoint	1	0	1	1	0	1	0
+KO_r1_endpoint	1	0	1	0	1	1	0
+KO_r2_baseline	1	0	0	0	0	0	1
+KO_r2_midpoint	1	0	1	1	0	0	1
+KO_r2_endpoint	1	0	1	0	1	0	1

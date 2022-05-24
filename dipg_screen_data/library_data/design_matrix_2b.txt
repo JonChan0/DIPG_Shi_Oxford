@@ -1,0 +1,13 @@
+samples	baseline	CON3	KO2	d11	d21	
+CON_r1_d0	1	0	0	0	0	
+CON_r1_d11	1	1	0	1	0	
+CON_r1_d21	1	1	0	0	1	
+CON_r2_d0	1	0	0	0	0	
+CON_r2_d11	1	1	0	1	0	
+CON_r2_d21	1	1	0	0	1	
+KO_r1_d0	1	0	0	0	0	
+KO_r1_d11	1	0	1	1	0	
+KO_r1_d21	1	0	1	0	1	
+KO_r2_d0	1	0	0	0	0	
+KO_r2_d11	1	0	1	1	0	
+KO_r2_d21	1	0	1	0	1	

@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+*.bak
+
+temp/
+
+matthews_screen_data/
