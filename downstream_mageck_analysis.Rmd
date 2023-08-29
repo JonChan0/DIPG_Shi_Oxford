@@ -917,7 +917,7 @@ For reference, the beta score from MAGeCK-MLE provides a measure of selection (+
 ```{r import_mle}
 #! Need to define your MAGeCK mle derived gene_summary.txt here
 mle_gene_summary <- gene_summary_importer('mle2b.gene_summary.txt',working_directory)
-mle_dipg_essential <- gene_summary_importer('dipg_essential_v2.gene_summary.txt',working_directory)
+#mle_dipg_essential <- gene_summary_importer('dipg_essential_v2.gene_summary.txt',working_directory)
 
 #! This is not required if you don't want to change the column names
 column_names <-colnames(mle_gene_summary)
@@ -1237,39 +1237,49 @@ wald_tester <- function(input_mle_betas, input_mle_summary, covariance){
 }
 
 #This function plots a volcano plot of the derived Wald values
+## Change the top value to change how many genes are labelled in the plot i.e top '6' genes for example
 wald_volcano_plotter <- function(wald_vals, top){
   
   wald_vals <- wald_vals %>%
     mutate(abs_diff_rank = rank(-abs(Diff)),
            fdr_rank = rank(fdr),
-           Label = case_when(abs_diff_rank <= top | fdr_rank <= top ~ Gene,
-                             TRUE ~ ''),
-           Group = case_when(common_essential == TRUE ~ 'Common Essential',
-                             common_essential == FALSE & fdr > 0.05 ~ 'None',
-                             common_essential == FALSE & fdr <= 0.05 & Diff < 0 ~ 'K27M-specific Essential',
-                             common_essential == FALSE & fdr <= 0.05 & Diff > 0 ~ 'K27M-KO-specific Essential')) %>%
-    mutate(Group = factor(Group, levels =c('K27M-specific Essential','K27M-KO-specific Essential', 'Common Essential', 'None'), ordered=TRUE))
+           Label=case_when(Gene %in% c('ASCL1','BAMBI','AHR','ARNT','TPK1','MAP2K7','KDSR','TNFAIP6') ~ Gene, T~ ''),
+           Group=case_when(fdr <= 0.05 ~ 'Sig',
+                           T~'NonSig')) %>%
+    mutate(Group=factor(Group, levels=c('Sig','NonSig'), ordered=T))
+           
+           #Deprecated chunk As per Alan's request 29/08/23
+    #        Label = case_when(abs_diff_rank <= top | fdr_rank <= top ~ Gene,
+    #                          TRUE ~ ''),
+    #        Group = case_when(common_essential == TRUE ~ 'Common Essential',
+    #                          common_essential == FALSE & fdr > 0.05 ~ 'None',
+    #                          common_essential == FALSE & fdr <= 0.05 & Diff < 0 ~ 'K27M-specific Essential',
+    #                          common_essential == FALSE & fdr <= 0.05 & Diff > 0 ~ 'K27M-KO-specific Essential')) %>%
+    # mutate(Group = factor(Group, levels =c('K27M-specific Essential','K27M-KO-specific Essential', 'Common Essential', 'None'), ordered=TRUE))
   
-  write_tsv(wald_vals,paste('wald_diff_output.tsv'))
+  #write_tsv(wald_vals,paste('wald_diff_output.tsv'))
   
   volcano <- ggplot(wald_vals, aes(x=Diff, y = -log10(fdr)))+
     geom_point(aes(col=wald_vals$Group),alpha=0.25)+
-    scale_colour_manual(values=c('#e78ac3','#ffd92f','#a6d854','#b3b3b3'), labels=c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential','Common Essential','Insignificant Difference\nin Essentiality'))+
+    #scale_colour_manual(values=c('#e78ac3','#ffd92f','#a6d854','#b3b3b3'), labels=c('K27M-specific\nEssential', 'K27M-KO-specific\nEssential','Common Essential','Insignificant Difference\nin Essentiality'))+ 
+    scale_colour_manual(values=c('#8b0000','#b3b3b3'), labels=c('Significant','Non-Significant'))+ #As per Alan's request 29/08/23
     scale_x_continuous(expand=expansion(add=0.5))+
     #scale_alpha_manual(name = 'Statistically Signficant?',values = (c(0.2,0.5)))+
     geom_hline(aes(yintercept=-log10(0.05), linetype='5% Significance Threshold'), col='red')+
-    geom_vline(xintercept = 0, linetype = 2, alpha = 0.8, col='black')+
+    #geom_vline(xintercept = 0, linetype = 2, alpha = 0.8, col='black')+ #Deprecated as per Alan's request 29/08/23
     scale_linetype_manual(name = "Threshold", values = c(2), 
                           guide = guide_legend(override.aes = list(color = c('red'))))+
     xlab('Difference in Beta Score')+
     ylab('- log10 (Adjusted p-value)')+
-    labs(title=str_wrap(paste('Volcano plot from a Wald test of the difference in beta scores between K27M and K27M-KO lines'),width=65),
-         caption= 'Common essential genes sourced from DepMap Q1/22')+
-    theme(legend.title=element_blank(),
-          legend.spacing.y=unit(0.25,'cm'))+
-    guides(colour = guide_legend(byrow = TRUE))+
-    guides(alpha=FALSE)+ #Removes legend for alpha
-    geom_label_repel(aes(label = wald_vals$Label, col=wald_vals$Group), show.legend=FALSE, max.overlaps=25, force=5, force_pull=0.5)
+    #labs(title=str_wrap(paste('Volcano plot from a Wald test of the difference in beta scores between K27M and K27M-KO lines'),width=65),
+    #     caption= 'Common essential genes sourced from DepMap Q1/22')+
+    #theme(legend.title=element_blank(),
+    #      legend.spacing.y=unit(0.25,'cm'))+
+    #guides(colour = guide_legend(byrow = TRUE))+
+    #guides(alpha=FALSE)+ #Removes legend for alpha
+    theme(legend.position="none",
+          text=element_text(size=14))+ #Removes all legends as per Alan's request 29/08/23
+    geom_text_repel(aes(label = wald_vals$Label, col=wald_vals$Group), show.legend=FALSE, max.overlaps=25, force=5, force_pull=0.5) #Changed to text and not box As per Alan's request 29/08/23
   
   print(volcano)
   return(volcano)
@@ -1292,7 +1302,8 @@ wald_pval_hist_plotter <- function(input_pvals){
 }
   
 wald_pvals <- wald_tester(mle_betas_cc, mle_gene_summary, covar)
-wald_diff_volcano <- wald_volcano_plotter(wald_pvals, 6)
+wald_diff_volcano <- wald_volcano_plotter(wald_pvals, 5) #Changed top 5 as per Alan's request 29/08/23
+ggsave('wald_diff_volcano_for_alan_230829.png',wald_diff_volcano, dpi=600, height=6, width=6) #As per Alan's request 29/08/23
 wald_pval_hist <- wald_pval_hist_plotter(wald_pvals)
 
 multiple_plot_exporter(list(wald_diff_volcano,wald_pval_hist), 'wald_diff_volcano_mageck')
