@@ -14,7 +14,7 @@ bibliography:
 #Loading packages
 knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
 library(tidyverse)
-library(MAGeCKFlute)
+# library(MAGeCKFlute)
 library(clusterProfiler)
 library(reshape2)
 library(viridis)
@@ -46,6 +46,38 @@ multiple_plot_exporter <- function(input_plot_list, pdf_name){
   }
   dev.off()
 }
+#This function prints the underlying summary statistics for every box in a ggplot boxplot.
+#It pulls the exact values that ggplot draws (via ggplot_build) so the printout matches the figure:
+#minimum, lower whisker, 25th percentile (lower box bound), median (centre),
+#75th percentile (upper box bound), upper whisker and maximum, per box.
+print_boxplot_stats <- function(plot, plot_name='', output_name=''){
+  built <- ggplot_build(plot)
+  #Identify which layer is the boxplot layer
+  box_layer <- which(sapply(plot$layers, function(l) inherits(l$geom, 'GeomBoxplot')))
+  if (length(box_layer) == 0){
+    message('No boxplot layer found in ', plot_name)
+    return(invisible(NULL))
+  }
+  box_data <- built$data[[box_layer[[1]]]]
+  #Recover the x-axis label for each box (falls back to numeric x position)
+  x_labels <- tryCatch(built$layout$panel_params[[1]]$x$get_labels(),
+                       error = function(e) NULL)
+  position <- if (!is.null(x_labels)) x_labels[box_data$x] else box_data$x
+  stats_tb <- tibble(
+    position       = position,
+    minimum        = box_data$ymin_final,   #data minimum, including outliers
+    lower_whisker  = box_data$ymin,         #lower whisker end
+    Q1_25th_pctile = box_data$lower,        #lower box bound = 25th percentile
+    median_centre  = box_data$middle,       #box centre = median
+    Q3_75th_pctile = box_data$upper,        #upper box bound = 75th percentile
+    upper_whisker  = box_data$ymax,         #upper whisker end
+    maximum        = box_data$ymax_final    #data maximum, including outliers
+  )
+  cat('\nBoxplot summary statistics:', plot_name, '\n')
+  write_tsv(stats_tb, str_glue('boxplot_sumstats_{output_name}.tsv'))
+  return(invisible(stats_tb))
+}
+
 #This function is for the import of MAGeCK derived gene_summary.txt files
 gene_summary_importer <- function(filename, working_directory){
   gene_summary <- as_tibble(read_delim(paste(working_directory,filename, sep='/')))
@@ -60,9 +92,6 @@ common_essentials <- read_csv(paste(working_directory,'library_data/CRISPR_commo
 #This imports the list of coding tumour suppressor genes from TSGene Database (6-05-2022 Version)
 tsgenes <- read_csv(paste(working_directory,'library_data/TSGene_coding_tsg.csv', sep='/')) %>%
   rename(gene = `Gene Name`)
-
-
-
 ```
 
 # Downstream Analysis of MAGeCK-MLE via MAGeCK-FLUTE Pipeline
@@ -404,9 +433,9 @@ biorep_groupnames <- c(
 biorep_annotator <- function(input_norm_counts, samples_to_include, biorep_group_names){ #Ensure that samples to include is a list with character vectors containing names of bioreplicates
   
   all_samples <- flatten_chr(samples_to_include)
-  
+  print(all_samples)
   norm_counts <- input_norm_counts %>%
-    select(Gene, sgRNA, contains(all_of(all_samples))) %>%
+    select(Gene, sgRNA, matches(str_c(all_samples,collapse='|'))) %>%
     reshape2::melt() %>%
     rename(sample=  variable, norm_count = value)
     
@@ -520,6 +549,7 @@ biorep_norm_read_dist_plotter <- function(norm_counts, samples_to_include, biore
    
   
   print(biorep_boxplot_distribution)
+  print_boxplot_stats(biorep_boxplot_distribution, 'biorep_boxplot_distribution')
   #ggsave(paste(prefix,'biorep_boxplot_distribution.png',sep='_'), biorep_boxplot_distribution)
   
   return(list(biorep_freqpoly_distribution, biorep_boxplot_distribution))
@@ -771,9 +801,8 @@ ctrl_baseline_r1 <- paste(ctrlname,'r1',baseline,sep='_')
                               'Day 0 (R2)','Day 11 (R2)', 'Day 21 (R2)'))
     
   print(read_distribution)
+  print_boxplot_stats(read_distribution, 'nt_control_read_distribution','nt_control_read_distribution')
   return(read_distribution)
-  
-  
 }
 
 positive_control_count_plotter <- function(input_normalised_counts,ctrlname, samplename, samples_to_include, baseline, midpt, endpt, depmap_or_tsg){
@@ -842,13 +871,14 @@ positive_control_count_plotter <- function(input_normalised_counts,ctrlname, sam
                               'Day 0 (R2)','Day 11 (R2)', 'Day 21 (R2)'))
   
   print(read_distribution)
-  
+  print_boxplot_stats(read_distribution, paste('positive_control_read_distribution', depmap_or_tsg, sep='_'),paste('positive_control_read_distribution', depmap_or_tsg, sep='_'))
+
   return(read_distribution)
 }
 
 dipg_nt_control_counts<- nt_control_distribution_plotter(norm_counts, 'CON','KO',c(rep1_samples,rep2_samples),'d0','d11','d21')
 dipg_depmap_control_counts <- positive_control_count_plotter(norm_counts, 'CON','KO',c(rep1_samples,rep2_samples),'d0','d11','d21', 'depmap')
-dipg_tsg_control_counts <- positive_control_count_plotter(norm_counts, 'CON','KO',c(rep1_samples,rep2_samples),'d0','d11','d21', 'tsg')
+# dipg_tsg_control_counts <- positive_control_count_plotter(norm_counts, 'CON','KO',c(rep1_samples,rep2_samples),'d0','d11','d21', 'tsg')
 
 
 dipg_control_count_plots <- list(dipg_nt_control_counts, dipg_depmap_control_counts, dipg_tsg_control_counts)
@@ -1658,8 +1688,9 @@ individual_gene_boxplotter <- function(input_norm_counts, subset_gene_name, gene
     #}
     
     print(read_distribution)
+    print_boxplot_stats(read_distribution, paste('individual_gene_boxplot', subset_gene_name, sep='_'))
     return(read_distribution)
-    
+
 }
 
 #LMAO, YOU COULD TOTALLY DO ALL THESE WITH A SIMPLE MAP() FUNCTION
